@@ -182,6 +182,41 @@ class Branch(models.Model):
         blank=True,
         help_text="Physical location description for MRA records"
     )
+    mra_site_id = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        help_text="MRA EIS terminal site ID mapped to this local branch"
+    )
+    mra_site_name = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="MRA EIS terminal site name mapped to this local branch"
+    )
+    mra_terminal_id = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Last activated MRA terminal ID for this branch"
+    )
+    mra_terminal_position = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="MRA terminal position returned during terminal activation"
+    )
+    is_eis_warehouse = models.BooleanField(
+        default=False,
+        help_text="Treat this branch as an EIS warehouse/location for stock transfers"
+    )
+    eis_mapping_source = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="Where the current EIS branch mapping came from"
+    )
+    eis_mapping_updated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When this branch's EIS mapping was last updated"
+    )
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -198,6 +233,7 @@ class Branch(models.Model):
         indexes = [
             models.Index(fields=['business', 'is_active']),
             models.Index(fields=['mra_branch_code']),
+            models.Index(fields=['mra_site_id']),
             models.Index(fields=['is_dirty']),
         ]
 

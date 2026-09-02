@@ -394,11 +394,18 @@ class DashboardViewSet(viewsets.ViewSet):
         
         active_session_data = None
         if active_session:
+            active_order_statuses = ['New', 'Preparing', 'Ready', 'Completed']
             # Calculate session totals from active session(s)
             if is_admin_user:
-                session_orders = Order.objects.filter(session__in=active_sessions)
+                session_orders = Order.objects.filter(
+                    session__in=active_sessions,
+                    status__in=active_order_statuses,
+                )
             else:
-                session_orders = Order.objects.filter(session=active_session)
+                session_orders = Order.objects.filter(
+                    session=active_session,
+                    status__in=active_order_statuses,
+                )
             
             total_sales = Decimal('0.00')
             total_cash_sales = Decimal('0.00')
@@ -408,7 +415,7 @@ class DashboardViewSet(viewsets.ViewSet):
             total_other_sales = Decimal('0.00')
             
             for order in session_orders:
-                total_sales += order.total
+                total_sales += order.subtotal
                 
                 # Normalize payment method (strip whitespace, handle case sensitivity)
                 pm = str(order.payment_method).strip() if order.payment_method else 'Cash'

@@ -166,6 +166,13 @@ class LoginView(generics.GenericAPIView):
                 status=status.HTTP_401_UNAUTHORIZED
             )
 
+        if not getattr(user, 'is_active', True):
+            print(f"[DEBUG LOGIN] Inactive user attempted login: {user}")
+            return Response(
+                {'error': 'This account is inactive. Please contact your administrator.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
         print(f"[DEBUG LOGIN] Login successful for user: {user}, id: {user.id}")
         
         # Check businesses for this user

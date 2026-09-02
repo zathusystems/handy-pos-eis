@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 from datetime import timedelta
 from django.core.exceptions import ImproperlyConfigured
+from corsheaders.defaults import default_headers
 
 try:
     from celery.schedules import crontab  # type: ignore
@@ -71,12 +72,16 @@ ALLOW_INSECURE_LOCAL = os.getenv('ALLOW_INSECURE_LOCAL', 'False').lower() == 'tr
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-ahtru+th!b@60+qr3dv-e5tp-f+)w_^&46s14$7ke6i0#d$kj4')
+SECRET_KEY = os.getenv('SECRET_KEY', '').strip()
+if not SECRET_KEY:
+    if IS_PRODUCTION:
+        raise ImproperlyConfigured('SECRET_KEY must be configured in production.')
+    SECRET_KEY = 'django-insecure-ahtru+th!b@60+qr3dv-e5tp-f+)w_^&46s14$7ke6i0#d$kj4'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-#DEBUG = os.getenv('DEBUG', 'True').lower() == 'true'
-
-DEBUG = os.getenv('DEBUG', 'True').lower() == 'true'
+DEBUG = os.getenv('DEBUG', 'False' if IS_PRODUCTION else 'True').lower() == 'true'
+if IS_PRODUCTION and DEBUG:
+    raise ImproperlyConfigured('DEBUG must be False in production.')
 USE_POSTGRES = os.getenv('USE_POSTGRES', 'False').lower() == 'true'
 
 
@@ -92,7 +97,7 @@ DEFAULT_ALLOWED_HOSTS = [
     '0.0.0.0',
     '[::1]',  # IPv6 localhost
     '10.230.100.89',  # LAN access for mobile clients
-    'www.pos.zathusystems.com', 'pos.zathusystems.com'
+    'www.pos.zathusystems.com', 'pos.zathusystems.com', 'pos3.express-travel-ticketing.online'
 ]
 
 ALLOWED_HOSTS = list(
@@ -271,6 +276,9 @@ def _build_database_settings():
             'default': {
                 'ENGINE': 'django.db.backends.sqlite3',
                 'NAME': BASE_DIR / 'db.sqlite3',
+                'OPTIONS': {
+                    'timeout': _env_int('SQLITE_TIMEOUT_SECONDS', 30),
+                },
             }
         }
     return {'default': _build_postgres_database()}
@@ -372,6 +380,9 @@ CORS_ALLOWED_ORIGINS = list(
 )
 CORS_ALLOW_CREDENTIALS = True
 CORS_EXPOSE_HEADERS = ['Content-Type', 'Authorization']
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'x-handypos-device-serial',
+]
 
 # ============================================
 # CSRF CONFIGURATION - TAURI DESKTOP APP
@@ -550,11 +561,82 @@ MRA_EIS_BASE_URL = os.getenv(
     'MRA_EIS_BASE_URL',
     'https://eis-api.mra.mw' if MRA_EIS_IS_LIVE else 'https://dev-eis-api.mra.mw',
 ).rstrip('/')
-MRA_EIS_TIMEOUT_SECONDS = int(os.getenv('MRA_EIS_TIMEOUT_SECONDS', '30'))
+MRA_EIS_TIMEOUT_SECONDS = int(os.getenv('MRA_EIS_TIMEOUT_SECONDS', '8'))
+MRA_EIS_VERIFY_SSL = os.getenv('MRA_EIS_VERIFY_SSL', 'True').lower() == 'true'
 
-# Access credentials used by MRA gateway (if enabled)
+# MRA onboarding access key for production TAC activation.
+# The terminal signing secret is normally returned by the TAC activation response
+# and stored on the Terminal record, not pre-filled here.
 MRA_EIS_ACCESS_KEY = os.getenv('MRA_EIS_ACCESS_KEY', '')
 MRA_EIS_SECRET_KEY = os.getenv('MRA_EIS_SECRET_KEY', '')
+MRA_EIS_CREDENTIAL_ENCRYPTION_KEY = os.getenv('MRA_EIS_CREDENTIAL_ENCRYPTION_KEY', '').strip()
+MRA_EIS_PRODUCT_ID = os.getenv('MRA_EIS_PRODUCT_ID', 'HandyPOS')
+MRA_EIS_DEFAULT_SUPPLIER_ID = _env_int('MRA_EIS_DEFAULT_SUPPLIER_ID', 0) or None
+MRA_EIS_CONFIG_MAX_AGE_HOURS = _env_int('MRA_EIS_CONFIG_MAX_AGE_HOURS', 24) or 24
+MRA_EIS_SERVER_TIME_MAX_AGE_HOURS = _env_int('MRA_EIS_SERVER_TIME_MAX_AGE_HOURS', 24) or 24
+MRA_EIS_REQUIRE_FRESH_CONFIG_FOR_SALES = os.getenv(
+    'MRA_EIS_REQUIRE_FRESH_CONFIG_FOR_SALES',
+    'True',
+).lower() == 'true'
+MRA_EIS_REQUIRE_OFFLINE_REPLAY_SEQUENCE_GUARD = os.getenv(
+    'MRA_EIS_REQUIRE_OFFLINE_REPLAY_SEQUENCE_GUARD',
+    'True',
+).lower() == 'true'
+MRA_EIS_REQUIRE_REMOTE_SEQUENCE_RECOVERY_FOR_SALES = os.getenv(
+    'MRA_EIS_REQUIRE_REMOTE_SEQUENCE_RECOVERY_FOR_SALES',
+    'True',
+).lower() == 'true'
+MRA_EIS_ALWAYS_OFFLINE_B2C = os.getenv(
+    'MRA_EIS_ALWAYS_OFFLINE_B2C',
+    'False',
+).lower() == 'true'
+MRA_EIS_ENFORCE_TERMINAL_DEVICE_BINDING = os.getenv(
+    'MRA_EIS_ENFORCE_TERMINAL_DEVICE_BINDING',
+    'True',
+).lower() == 'true'
+MRA_EIS_CHECK_TERMINAL_BLOCK_BEFORE_SALE = os.getenv(
+    'MRA_EIS_CHECK_TERMINAL_BLOCK_BEFORE_SALE',
+    'True',
+).lower() == 'true'
+MRA_EIS_VALIDATE_BUYER_TIN_BEFORE_SALE = os.getenv('MRA_EIS_VALIDATE_BUYER_TIN_BEFORE_SALE', 'True').lower() == 'true'
+MRA_EIS_VALIDATE_VAT5_BEFORE_SALE = os.getenv('MRA_EIS_VALIDATE_VAT5_BEFORE_SALE', 'True').lower() == 'true'
+MRA_EIS_ADJUST_STOCK_ON_VOID = os.getenv('MRA_EIS_ADJUST_STOCK_ON_VOID', 'True').lower() == 'true'
+MRA_EIS_RECEIVE_STOCK_USE_GOODS_RECEIVING = os.getenv(
+    'MRA_EIS_RECEIVE_STOCK_USE_GOODS_RECEIVING',
+    'True',
+).lower() == 'true'
+MRA_EIS_STOCK_ADJUSTMENT_REASON_FALLBACK = os.getenv('MRA_EIS_STOCK_ADJUSTMENT_REASON_FALLBACK', 'Other')
+MRA_EIS_STOCK_INCREASE_ADJUSTMENT_REASON = os.getenv('MRA_EIS_STOCK_INCREASE_ADJUSTMENT_REASON', '')
+MRA_EIS_STOCK_DECREASE_ADJUSTMENT_REASON = os.getenv('MRA_EIS_STOCK_DECREASE_ADJUSTMENT_REASON', '')
+MRA_EIS_MESSAGE_HASH_INPUT_MODE = os.getenv('MRA_EIS_MESSAGE_HASH_INPUT_MODE', 'canonical_json').strip().lower()
+MRA_EIS_MESSAGE_HASH_INPUT_MODE_ALIASES = {
+    'canonical': 'canonical_json',
+    'canonical-json': 'canonical_json',
+    'compact': 'compact_json',
+    'compact-json': 'compact_json',
+    'raw': 'raw_json',
+    'raw-json': 'raw_json',
+}
+MRA_EIS_MESSAGE_HASH_INPUT_MODE = MRA_EIS_MESSAGE_HASH_INPUT_MODE_ALIASES.get(
+    MRA_EIS_MESSAGE_HASH_INPUT_MODE,
+    MRA_EIS_MESSAGE_HASH_INPUT_MODE,
+)
+if MRA_EIS_MESSAGE_HASH_INPUT_MODE not in {'canonical_json', 'compact_json', 'raw_json'}:
+    raise ImproperlyConfigured(
+        'MRA_EIS_MESSAGE_HASH_INPUT_MODE must be canonical_json, compact_json, or raw_json.'
+    )
+MRA_EIS_RECORD_MESSAGE_HASH_EVIDENCE = os.getenv(
+    'MRA_EIS_RECORD_MESSAGE_HASH_EVIDENCE',
+    'True',
+).lower() == 'true'
+MRA_EIS_LOG_MESSAGE_HASH_INPUT = os.getenv(
+    'MRA_EIS_LOG_MESSAGE_HASH_INPUT',
+    'False' if MRA_EIS_IS_LIVE else 'True',
+).lower() == 'true'
+MRA_EIS_MESSAGE_HASH_INPUT_CONFIRMED_BY_MRA = os.getenv(
+    'MRA_EIS_MESSAGE_HASH_INPUT_CONFIRMED_BY_MRA',
+    'False',
+).lower() == 'true'
 
 # Safety switches:
 # - DRY_RUN=True: build payloads and mark records ready, but never submit to MRA
@@ -580,6 +662,15 @@ MRA_EIS_STRICT_PRODUCT_CODES = os.getenv(
 ).lower() == 'true'
 
 MRA_EIS_DEFAULT_CURRENCY = os.getenv('MRA_EIS_DEFAULT_CURRENCY', 'MWK')
+MRA_EIS_INITIAL_INVENTORY_BATCH_SIZE = _env_int('MRA_EIS_INITIAL_INVENTORY_BATCH_SIZE', 50) or 50
+MRA_EIS_OFFLINE_VALIDATION_BASE_URL = os.getenv(
+    'MRA_EIS_OFFLINE_VALIDATION_BASE_URL',
+    (
+        'https://eis-portal.mra.mw/ReceiptValidation/Validate/'
+        if MRA_EIS_IS_LIVE
+        else 'https://dev-eis-portal.mra.mw/ReceiptValidation/Validate/'
+    ),
+).rstrip('/')
 
 if MRA_EIS_IS_LIVE:
     if 'dev-eis-api' in MRA_EIS_BASE_URL.lower():
@@ -590,28 +681,101 @@ if MRA_EIS_IS_LIVE:
         raise ImproperlyConfigured('MRA_EIS_ENABLE_HTTP_CALLS must be True when MRA_EIS_MODE=LIVE.')
     if not MRA_EIS_ALLOW_LIVE_SUBMISSION:
         raise ImproperlyConfigured('MRA_EIS_ALLOW_LIVE_SUBMISSION must be True when MRA_EIS_MODE=LIVE.')
-    if not MRA_EIS_ACCESS_KEY or not MRA_EIS_SECRET_KEY:
+    if not MRA_EIS_PRODUCT_ID:
+        raise ImproperlyConfigured('MRA_EIS_PRODUCT_ID must be a non-empty POS product ID.')
+    if not MRA_EIS_VERIFY_SSL:
+        raise ImproperlyConfigured('MRA_EIS_VERIFY_SSL must be True when MRA_EIS_MODE=LIVE.')
+    if not MRA_EIS_CREDENTIAL_ENCRYPTION_KEY:
         raise ImproperlyConfigured(
-            'MRA_EIS_ACCESS_KEY and MRA_EIS_SECRET_KEY are required when MRA_EIS_MODE=LIVE.'
+            'MRA_EIS_CREDENTIAL_ENCRYPTION_KEY is required when MRA_EIS_MODE=LIVE.'
+        )
+    if MRA_EIS_LOG_MESSAGE_HASH_INPUT:
+        raise ImproperlyConfigured(
+            'MRA_EIS_LOG_MESSAGE_HASH_INPUT must be False when MRA_EIS_MODE=LIVE.'
         )
 
 # Official endpoint map (overrideable via env)
 MRA_EIS_ENDPOINTS = {
     'activate_terminal': os.getenv('MRA_EIS_ENDPOINT_ACTIVATE_TERMINAL', '/api/v1/onboarding/activate-terminal'),
-    'confirm_terminal': os.getenv('MRA_EIS_ENDPOINT_CONFIRM_TERMINAL', '/api/v1/onboarding/confirm-terminal'),
-    'report_sale': os.getenv('MRA_EIS_ENDPOINT_REPORT_SALE', '/api/v1/sales/report-sale'),
-    'report_sale_offline': os.getenv('MRA_EIS_ENDPOINT_REPORT_SALE_OFFLINE', '/api/v1/sales/report-sale-offline'),
+    'confirm_terminal': os.getenv(
+        'MRA_EIS_ENDPOINT_CONFIRM_TERMINAL',
+        '/api/v1/onboarding/terminal-activated-confirmation'
+    ),
+    'report_sale': os.getenv('MRA_EIS_ENDPOINT_REPORT_SALE', '/api/v1/sales/submit-sales-transaction'),
+    'report_sale_offline': os.getenv(
+        'MRA_EIS_ENDPOINT_REPORT_SALE_OFFLINE',
+        '/api/v1/sales/submit-sales-transaction'
+    ),
+    'get_last_online_transaction': os.getenv(
+        'MRA_EIS_ENDPOINT_GET_LAST_ONLINE_TRANSACTION',
+        '/api/v1/sales/last-submitted-online-transaction'
+    ),
     'get_last_offline_transaction': os.getenv(
         'MRA_EIS_ENDPOINT_GET_LAST_OFFLINE_TRANSACTION',
-        '/api/v1/sales/get-last-offline-transaction'
+        '/api/v1/sales/last-submitted-offline-transaction'
     ),
-    'save_inventory_items': os.getenv('MRA_EIS_ENDPOINT_SAVE_INVENTORY_ITEMS', '/api/v1/utilities/save-inventory-items'),
+    'request_new_terminal_token': os.getenv(
+        'MRA_EIS_ENDPOINT_REQUEST_NEW_TERMINAL_TOKEN',
+        '/api/v1/configuration/request-new-terminal-token'
+    ),
+    'process_credit_debit_note': os.getenv(
+        'MRA_EIS_ENDPOINT_PROCESS_CREDIT_DEBIT_NOTE',
+        '/api/v1/sales/process-credit-debit-note'
+    ),
+    'get_invoice_by_number': os.getenv(
+        'MRA_EIS_ENDPOINT_GET_INVOICE_BY_NUMBER',
+        '/api/v1/sales/get-invoice-by-number'
+    ),
+    'product_status': os.getenv('MRA_EIS_ENDPOINT_PRODUCT_STATUS', '/api/v1/utilities/product-status'),
+    'ping': os.getenv('MRA_EIS_ENDPOINT_PING', '/api/v1/utilities/ping'),
+    'initial_inventory_upload': os.getenv(
+        'MRA_EIS_ENDPOINT_INITIAL_INVENTORY_UPLOAD',
+        '/api/v1/utilities/taxpayer-initial-inventory-upload'
+    ),
     'get_terminal_site_products': os.getenv(
         'MRA_EIS_ENDPOINT_GET_TERMINAL_SITE_PRODUCTS',
         '/api/v1/utilities/get-terminal-site-products'
     ),
-    'sync_product_status': os.getenv('MRA_EIS_ENDPOINT_SYNC_PRODUCT_STATUS', '/api/v1/utilities/sync-product-status'),
-    'get_latest_config': os.getenv('MRA_EIS_ENDPOINT_GET_LATEST_CONFIG', '/api/v1/utilities/get-latest-config'),
+    'transfer_inventory': os.getenv(
+        'MRA_EIS_ENDPOINT_TRANSFER_INVENTORY',
+        '/api/v1/stock/transfer-inventory'
+    ),
+    'warehouse_inventory': os.getenv(
+        'MRA_EIS_ENDPOINT_WAREHOUSE_INVENTORY',
+        '/api/v1/stock/warehouse-inventory'
+    ),
+    'raw_material_inventory': os.getenv(
+        'MRA_EIS_ENDPOINT_RAW_MATERIAL_INVENTORY',
+        '/api/v1/raw-material/get-raw-material'
+    ),
+    'submit_informal_purchase': os.getenv(
+        'MRA_EIS_ENDPOINT_SUBMIT_INFORMAL_PURCHASE',
+        '/api/v1/stock/submit-informal-purchase'
+    ),
+    'submit_raw_material_conversion': os.getenv(
+        'MRA_EIS_ENDPOINT_SUBMIT_RAW_MATERIAL_CONVERSION',
+        '/api/v1/raw-material/submit-conversion'
+    ),
+    'submit_stock_adjustment': os.getenv(
+        'MRA_EIS_ENDPOINT_SUBMIT_STOCK_ADJUSTMENT',
+        '/api/v1/stock/submit-adjustment'
+    ),
+    'get_stock_adjustment_reasons': os.getenv(
+        'MRA_EIS_ENDPOINT_GET_STOCK_ADJUSTMENT_REASONS',
+        '/api/v1/stock/getStockAdjustmentReasons'
+    ),
+    'get_suppliers': os.getenv('MRA_EIS_ENDPOINT_GET_SUPPLIERS', '/api/v1/stock/get-suppliers'),
+    'add_product': os.getenv('MRA_EIS_ENDPOINT_ADD_PRODUCT', '/api/v1/stock/add-product'),
+    'get_hs_codes': os.getenv('MRA_EIS_ENDPOINT_GET_HS_CODES', '/api/v1/stock/get-hs-codes'),
+    'get_units_of_measure': os.getenv(
+        'MRA_EIS_ENDPOINT_GET_UNITS_OF_MEASURE',
+        '/api/v1/stock/get-units-of-measure'
+    ),
+    'sync_product_status': os.getenv('MRA_EIS_ENDPOINT_SYNC_PRODUCT_STATUS', '/api/v1/utilities/product-status'),
+    'get_latest_config': os.getenv(
+        'MRA_EIS_ENDPOINT_GET_LATEST_CONFIG',
+        '/api/v1/configuration/get-latest-configs'
+    ),
     'get_terminal_blocking_message': os.getenv(
         'MRA_EIS_ENDPOINT_GET_TERMINAL_BLOCKING_MESSAGE',
         '/api/v1/utilities/get-terminal-blocking-message'
@@ -620,7 +784,20 @@ MRA_EIS_ENDPOINTS = {
         'MRA_EIS_ENDPOINT_CHECK_TERMINAL_UNBLOCK_STATUS',
         '/api/v1/utilities/check-terminal-unblock-status'
     ),
-    'validate_vat5': os.getenv('MRA_EIS_ENDPOINT_VALIDATE_VAT5', '/api/v1/utilities/validate-vat5'),
+    'check_tin_authorization_requirement': os.getenv(
+        'MRA_EIS_ENDPOINT_CHECK_TIN_AUTHORIZATION_REQUIREMENT',
+        '/api/v1/utilities/check-tin-authorization-requirement'
+    ),
+    'validate_authorization_code': os.getenv(
+        'MRA_EIS_ENDPOINT_VALIDATE_AUTHORIZATION_CODE',
+        '/api/v1/utilities/validate-authorization-code'
+    ),
+    'validate_vat5': os.getenv(
+        'MRA_EIS_ENDPOINT_VALIDATE_VAT5',
+        '/api/v1/utilities/validate-vat5-certificate'
+    ),
+    'cancel_receipt': os.getenv('MRA_EIS_ENDPOINT_CANCEL_RECEIPT', '/api/v1/sales/cancel-receipt'),
+    'get_void_receipts': os.getenv('MRA_EIS_ENDPOINT_GET_VOID_RECEIPTS', '/api/v1/sales/get-void-receipts'),
 }
 
 # ============================================
@@ -645,6 +822,27 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
+
+# Periodic EIS background processing. This is the compliance path for
+# offline B2C replay; frontend sync is only a convenience trigger.
+MRA_EIS_SYNC_INTERVAL_MINUTES = int(os.getenv('MRA_EIS_SYNC_INTERVAL_MINUTES', '5'))
+MRA_EIS_RETRY_INTERVAL_MINUTES = int(os.getenv('MRA_EIS_RETRY_INTERVAL_MINUTES', '2'))
+MRA_EIS_SYNC_ALL_ACTIVE_TERMINALS = os.getenv(
+    'MRA_EIS_SYNC_ALL_ACTIVE_TERMINALS',
+    'True',
+).lower() == 'true'
+
+if crontab:
+    CELERY_BEAT_SCHEDULE = {
+        'mra-eis-sync-offline-invoices': {
+            'task': 'mra_eis.tasks.sync_offline_invoices_for_online_terminals',
+            'schedule': crontab(minute=f'*/{MRA_EIS_SYNC_INTERVAL_MINUTES}'),
+        },
+        'mra-eis-process-retry-queue': {
+            'task': 'mra_eis.tasks.process_mra_retry_queue',
+            'schedule': crontab(minute=f'*/{MRA_EIS_RETRY_INTERVAL_MINUTES}'),
+        },
+    }
 
 # ============================================
 # SENTRY CONFIGURATION (Optional)

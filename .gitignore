@@ -86,3 +86,9 @@ src-tauri/gen/schemas/
 handypos-release.jks
 key_pair
 key_pair.pub
+
+# Local EIS copies and signing material
+/.codex
+/eis_backend/
+/keystore.b64
+/Upload_initial_Inventory_Template.xlsx

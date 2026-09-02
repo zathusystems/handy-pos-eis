@@ -2695,7 +2695,7 @@ const PaymentDialog = ({
         );
 
         return (
-             <DialogContent className="tauri-android-safe-bottom max-h-[calc(100dvh-1rem)] w-[calc(100vw-1rem)] max-w-md overflow-y-auto p-4 sm:max-w-lg sm:p-6">
+             <DialogContent className="tauri-android-safe-bottom max-h-[calc(100vh-1rem)] max-h-[calc(100dvh-1rem)] w-[calc(100vw-1rem)] max-w-md overflow-y-auto p-4 sm:max-w-lg sm:p-6">
                 <DialogHeader>
                     <DialogTitle className="flex items-center justify-center text-center">
                         <CheckCircle className="h-12 w-12 text-green-500" />
@@ -2751,7 +2751,7 @@ const PaymentDialog = ({
                     />
                  </div>
                 <Dialog open={isReceiptPreviewOpen} onOpenChange={setIsReceiptPreviewOpen}>
-                    <DialogContent className="tauri-android-safe-bottom max-h-[calc(100dvh-1rem)] w-[calc(100vw-1rem)] max-w-[420px] overflow-y-auto p-4 sm:p-6">
+                    <DialogContent className="tauri-android-safe-bottom max-h-[calc(100vh-1rem)] max-h-[calc(100dvh-1rem)] w-[calc(100vw-1rem)] max-w-[420px] overflow-y-auto p-4 sm:p-6">
                         <DialogHeader>
                             <DialogTitle>Receipt</DialogTitle>
                             <DialogDescription>
@@ -2841,7 +2841,7 @@ const PaymentDialog = ({
     }
 
     return (
-        <DialogContent className="tauri-android-safe-bottom flex max-h-[calc(100dvh-1rem)] w-[calc(100vw-1rem)] max-w-2xl flex-col overflow-hidden p-4 sm:p-6">
+        <DialogContent className="tauri-android-safe-bottom flex max-h-[calc(100vh-1rem)] max-h-[calc(100dvh-1rem)] w-[calc(100vw-1rem)] max-w-2xl flex-col overflow-hidden p-4 sm:p-6">
             <DialogHeader>
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
                     <div>
@@ -3729,7 +3729,7 @@ export const GenericPos = ({
           <span className="font-bold">{formatCurrency(total)}</span>
         </Button>
       </DialogTrigger>
-      <DialogContent className="tauri-android-sidebar-safe-top m-0 flex h-full max-h-full w-full max-w-full flex-col gap-0 p-0 sm:max-w-full">
+      <DialogContent className="tauri-android-safe-bottom tauri-android-sidebar-safe-top left-0 top-0 m-0 flex h-screen h-[100dvh] max-h-screen max-h-[100dvh] w-full max-w-full translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 sm:left-1/2 sm:top-1/2 sm:h-auto sm:max-h-[90vh] sm:max-w-full sm:-translate-x-1/2 sm:-translate-y-1/2 sm:rounded-lg sm:border">
         <DialogHeader className="p-4 border-b">
           <div className="flex items-center justify-between">
             <DialogTitle>Current Order</DialogTitle>

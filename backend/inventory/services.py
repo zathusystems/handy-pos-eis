@@ -24,6 +24,91 @@ class InventoryService:
     """Service for MRA-compliant inventory operations"""
 
     @staticmethod
+    def _business_eis_enabled(business) -> bool:
+        settings_obj = getattr(business, 'settings', None)
+        return bool(getattr(settings_obj, 'enable_eis', False) or getattr(business, 'mra_enrolled', False))
+
+    @staticmethod
+    def _branch_eis_site_id(branch) -> str:
+        return str(
+            getattr(branch, 'mra_site_id', '')
+            or getattr(branch, 'mra_branch_code', '')
+            or ''
+        ).strip()
+
+    @staticmethod
+    def _validate_eis_branch_transfer_mapping(from_branch, to_branch, business) -> None:
+        if not InventoryService._business_eis_enabled(business):
+            return
+
+        missing = []
+        if not InventoryService._branch_eis_site_id(from_branch):
+            missing.append(f'source branch "{from_branch.name}"')
+        if not InventoryService._branch_eis_site_id(to_branch):
+            missing.append(f'destination branch "{to_branch.name}"')
+        if missing:
+            raise ValidationError(
+                'EIS branch transfer requires MRA site mapping for '
+                + ' and '.join(missing)
+                + '. Activate/map the branch before transferring stock.'
+            )
+
+    @staticmethod
+    def submit_eis_transfer_if_required(from_branch, to_branch, inventory_item, quantity):
+        """Submit branch/site inventory transfers to MRA when EIS is enabled."""
+        business = inventory_item.business
+        if not InventoryService._business_eis_enabled(business):
+            return None
+
+        InventoryService._validate_eis_branch_transfer_mapping(
+            from_branch,
+            to_branch,
+            business,
+        )
+
+        barcode = str(
+            getattr(inventory_item, 'product_code', '')
+            or getattr(inventory_item, 'barcode', '')
+            or getattr(inventory_item, 'sku', '')
+            or ''
+        ).strip()
+        if not barcode:
+            raise ValidationError(
+                f'EIS transfer requires a product code/barcode for "{inventory_item.name}".'
+            )
+
+        from mra_eis.models import Terminal
+        from mra_eis.services import ProductMappingService
+
+        terminal = (
+            Terminal.objects.filter(business=business, branch=from_branch, status='active')
+            .order_by('-updated_at', '-created_at')
+            .first()
+            or Terminal.objects.filter(business=business, status='active')
+            .order_by('-updated_at', '-created_at')
+            .first()
+        )
+        if not terminal:
+            raise ValidationError('Activate an EIS terminal before transferring stock.')
+
+        transfer_item = {
+            'barcode': barcode,
+            'quantity': quantity,
+        }
+        price = getattr(inventory_item, 'price', None)
+        if price not in (None, ''):
+            transfer_item['price'] = price
+
+        return ProductMappingService.transfer_inventory(
+            business=business,
+            terminal=terminal,
+            items=[transfer_item],
+            to_branch=to_branch,
+            from_site_id=InventoryService._branch_eis_site_id(from_branch),
+            from_warehouse_to_site=False,
+        )
+
+    @staticmethod
     def validate_product_for_sale(inventory_item):
         """
         Validate that a product is ready for MRA sale.
@@ -217,6 +302,12 @@ class InventoryService:
         """
         if quantity <= 0:
             raise ValidationError("Quantity must be positive")
+
+        InventoryService._validate_eis_branch_transfer_mapping(
+            from_branch,
+            to_branch,
+            inventory_item.business,
+        )
         
         if quantity > inventory_item.stock_units:
             raise ValidationError(
@@ -303,6 +394,13 @@ class InventoryService:
                 f"Cannot transfer {quantity}. "
                 f"Only {inventory_item.stock_units} available."
             )
+
+        eis_transfer_result = InventoryService.submit_eis_transfer_if_required(
+            from_branch,
+            to_branch,
+            inventory_item,
+            quantity,
+        )
         
         # Create transfer record
         transfer = StockTransfer.objects.create(
@@ -312,7 +410,7 @@ class InventoryService:
             inventory_item=inventory_item,
             quantity=quantity,
             transfer_reference=transfer_reference,
-            mra_notified=False,
+            mra_notified=bool(eis_transfer_result),
             initiated_by=user.email if user else "system",
         )
         
@@ -323,6 +421,38 @@ class InventoryService:
             reason='TRANSFER_OUT',
             user=user
         )
+
+        destination_item, created = InventoryItem.objects.get_or_create(
+            business=inventory_item.business,
+            branch=to_branch,
+            name=inventory_item.name,
+            defaults={
+                'category': inventory_item.category,
+                'item_type': inventory_item.item_type,
+                'stock_units': quantity,
+                'unit_type': inventory_item.unit_type,
+                'reorder_level': inventory_item.reorder_level,
+                'status': 'In Stock' if quantity > 0 else 'Out of Stock',
+                'cost': inventory_item.cost,
+                'price': inventory_item.price,
+                'value': quantity * (inventory_item.cost or 0),
+                'is_variable_price': inventory_item.is_variable_price,
+                'is_fuel': getattr(inventory_item, 'is_fuel', False),
+                'is_oil': getattr(inventory_item, 'is_oil', False),
+                'supplier': inventory_item.supplier,
+                'manufacturer': inventory_item.manufacturer,
+                'batch': inventory_item.batch,
+                'brand': inventory_item.brand,
+                'expiry': inventory_item.expiry,
+                'sku': inventory_item.sku,
+                'barcode': inventory_item.barcode,
+            },
+        )
+        if not created:
+            destination_item.stock_units += quantity
+            destination_item.value = destination_item.stock_units * (destination_item.cost or 0)
+            destination_item.update_status()
+            destination_item.save(update_fields=['stock_units', 'value', 'status'])
         
         # Log to audit
         AuditLog.objects.create(

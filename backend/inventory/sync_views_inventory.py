@@ -4,6 +4,7 @@ Handles synchronization of inventory items between frontend and backend
 """
 
 import math
+import uuid
 from django.db import IntegrityError
 
 from .models import InventoryItem
@@ -45,6 +46,14 @@ def _parse_bool(value, default=False):
         if normalized in ('false', '0', 'no', 'n', 'off', ''):
             return False
     return default
+
+
+def _is_valid_uuid(value):
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def handle_create_inventory_item(item_id, data, business, branch_id):
@@ -125,6 +134,10 @@ def handle_create_inventory_item(item_id, data, business, branch_id):
         if is_fuel_raw is None:
             is_fuel_raw = data.get('isFuel', False)
 
+        is_oil_raw = data.get('is_oil')
+        if is_oil_raw is None:
+            is_oil_raw = data.get('isOil', False)
+
         is_produced_raw = data.get('is_produced')
         if is_produced_raw is None:
             is_produced_raw = data.get('isProduced', False)
@@ -170,6 +183,7 @@ def handle_create_inventory_item(item_id, data, business, branch_id):
             'image': clean_value(data.get('image')),
             'is_variable_price': _parse_bool(is_variable_price_raw, False),
             'is_fuel': _parse_bool(is_fuel_raw, False),
+            'is_oil': _parse_bool(is_oil_raw, False),
             'is_produced': _parse_bool(is_produced_raw, False),
             'on_menu': _parse_bool(on_menu_raw, False),
             'is_sold_in_portions': _parse_bool(is_sold_in_portions_raw, False),
@@ -246,11 +260,19 @@ def handle_update_inventory_item(item_id, data, business, branch_id):
     try:
         print(f"[Sync] Updating inventory item {item_id} with data keys: {list(data.keys())}")
         
-        item = InventoryItem.objects.get(
-            id=item_id,
-            business=business,
-            branch_id=branch_id
-        )
+        if _is_valid_uuid(item_id):
+            item = InventoryItem.objects.get(
+                id=item_id,
+                business=business,
+                branch_id=branch_id
+            )
+        else:
+            item_name = data.get('name')
+            item = InventoryItem.objects.get(
+                name=item_name,
+                business=business,
+                branch_id=branch_id
+            )
         
         print(f"[Sync] Found item {item_id}, current stock_units: {item.stock_units}")
         
@@ -326,6 +348,11 @@ def handle_update_inventory_item(item_id, data, business, branch_id):
             item.is_fuel = _parse_bool(
                 data.get('is_fuel', data.get('isFuel')),
                 item.is_fuel
+            )
+        if 'is_oil' in data or 'isOil' in data:
+            item.is_oil = _parse_bool(
+                data.get('is_oil', data.get('isOil')),
+                item.is_oil
             )
         if 'is_produced' in data or 'isProduced' in data:
             item.is_produced = _parse_bool(

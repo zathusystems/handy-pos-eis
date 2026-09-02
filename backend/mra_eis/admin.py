@@ -4,7 +4,7 @@ MRA EIS Admin Configuration
 from django.contrib import admin
 from django.utils.html import format_html
 from .models import (
-    Terminal, TerminalActivationCode, MRAConfiguration, MRAProductMapping,
+    Terminal, TerminalActivationCode, MRAConfiguration,
     MRAInvoice, OfflineInvoiceQueue, OfflineAuditLog, Receipt,
     InvoiceAuditLog, TerminalAuditLog, MRAAPIError, SyncRetryQueue,
     ConfigurationSyncLog
@@ -15,14 +15,15 @@ from .models import (
 class TerminalAdmin(admin.ModelAdmin):
     list_display = [
         'terminal_id', 'business', 'branch', 'status_badge',
-        'is_online_badge', 'online_invoice_counter', 'offline_invoice_counter',
+        'is_online_badge', 'mra_taxpayer_id', 'terminal_position',
+        'online_invoice_counter', 'offline_invoice_counter',
         'activated_at', 'last_sync_at'
     ]
     list_filter = ['status', 'is_online', 'os_type', 'created_at']
     search_fields = ['terminal_id', 'mra_terminal_id', 'device_serial']
     readonly_fields = [
         'id', 'terminal_id', 'online_invoice_counter', 'offline_invoice_counter',
-        'created_at', 'updated_at'
+        'credential_status', 'created_at', 'updated_at'
     ]
     fieldsets = (
         ('Identification', {
@@ -34,8 +35,11 @@ class TerminalAdmin(admin.ModelAdmin):
         ('POS Information', {
             'fields': ('pos_name', 'pos_version', 'os_type')
         }),
-        ('MRA Credentials', {
-            'fields': ('mra_terminal_id', 'mra_api_key', 'mra_token', 'token_expires_at'),
+        ('MRA Connection', {
+            'fields': (
+                'mra_terminal_id', 'mra_taxpayer_id', 'terminal_position',
+                'credential_status', 'token_expires_at'
+            ),
             'classes': ('collapse',)
         }),
         ('Status', {
@@ -72,6 +76,10 @@ class TerminalAdmin(admin.ModelAdmin):
             color, text
         )
     is_online_badge.short_description = 'Connectivity'
+
+    def credential_status(self, obj):
+        return 'Stored securely' if obj.mra_api_key or obj.mra_token else 'Not available'
+    credential_status.short_description = 'Credentials'
 
 
 @admin.register(TerminalActivationCode)
@@ -115,35 +123,6 @@ class MRAConfigurationAdmin(admin.ModelAdmin):
         }),
         ('Audit', {
             'fields': ('fetched_from_mra_at', 'created_at'),
-            'classes': ('collapse',)
-        }),
-    )
-
-
-@admin.register(MRAProductMapping)
-class MRAProductMappingAdmin(admin.ModelAdmin):
-    list_display = [
-        'product_name', 'mra_product_code', 'business', 'tax_category',
-        'approved_price', 'tax_rate', 'is_approved', 'is_active'
-    ]
-    list_filter = ['tax_category', 'is_approved', 'is_active', 'created_at']
-    search_fields = ['product_name', 'mra_product_code', 'business__name']
-    readonly_fields = ['id', 'created_at', 'updated_at']
-    fieldsets = (
-        ('Internal Product', {
-            'fields': ('id', 'business', 'inventory_item_id', 'product_name')
-        }),
-        ('MRA Mapping', {
-            'fields': ('mra_product_code', 'mra_product_name', 'tax_category')
-        }),
-        ('Pricing & Tax', {
-            'fields': ('approved_price', 'tax_rate')
-        }),
-        ('Status', {
-            'fields': ('is_approved', 'is_active', 'approved_at')
-        }),
-        ('Audit', {
-            'fields': ('created_at', 'updated_at'),
             'classes': ('collapse',)
         }),
     )

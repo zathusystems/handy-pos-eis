@@ -11,6 +11,8 @@ from django.contrib.auth import get_user_model
 from django.utils import timezone
 from django.core.validators import MinValueValidator, MaxValueValidator
 from business.models import Business, Branch
+from .fields import EncryptedTextField
+from .security import redact_sensitive_data, redact_sensitive_text
 
 User = get_user_model()
 
@@ -65,13 +67,22 @@ class Terminal(models.Model):
         unique=True,
         help_text="Terminal ID from MRA"
     )
-    mra_api_key = models.CharField(
-        max_length=500,
-        help_text="API key for MRA communication (should be encrypted)"
-    )
-    mra_token = models.TextField(
+    mra_taxpayer_id = models.BigIntegerField(
+        null=True,
         blank=True,
-        help_text="Current authentication token from MRA"
+        help_text="Numeric taxpayer ID from MRA activation response; used in fiscal invoice number generation"
+    )
+    terminal_position = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Terminal position from MRA activation response; used in fiscal invoice number generation"
+    )
+    mra_api_key = EncryptedTextField(
+        help_text="API key for MRA communication (encrypted at rest)"
+    )
+    mra_token = EncryptedTextField(
+        blank=True,
+        help_text="Current authentication token from MRA (encrypted at rest)"
     )
     token_expires_at = models.DateTimeField(
         null=True,
@@ -103,10 +114,10 @@ class Terminal(models.Model):
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['business', 'branch']),
+            models.Index(fields=['business', 'branch', 'device_serial']),
             models.Index(fields=['status']),
             models.Index(fields=['mra_terminal_id']),
         ]
-        unique_together = ('business', 'branch')
 
     def __str__(self):
         return f"Terminal {self.terminal_id} - {self.branch.name}"
@@ -130,6 +141,32 @@ class Terminal(models.Model):
         Terminal.objects.filter(pk=self.pk).update(offline_invoice_counter=F('offline_invoice_counter') + 1)
         self.refresh_from_db()
         return self.offline_invoice_counter
+
+
+class FiscalInvoiceSequence(models.Model):
+    """
+    Daily fiscal invoice sequence per MRA terminal.
+
+    MRA fiscal invoice numbers encode taxpayer ID, terminal position, Julian
+    date, and a single daily count. Online and offline receipts must draw from
+    this same counter to avoid same-day duplicate invoice numbers.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    terminal = models.ForeignKey(Terminal, on_delete=models.CASCADE, related_name='fiscal_sequences')
+    julian_date = models.PositiveIntegerField(help_text="MRA Julian date encoded in the fiscal invoice number")
+    last_sequence = models.BigIntegerField(default=0, validators=[MinValueValidator(0)])
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-julian_date']
+        unique_together = ('terminal', 'julian_date')
+        indexes = [
+            models.Index(fields=['terminal', 'julian_date']),
+        ]
+
+    def __str__(self):
+        return f"{self.terminal.terminal_id} / {self.julian_date}: {self.last_sequence}"
 
 
 class TerminalActivationCode(models.Model):
@@ -212,6 +249,10 @@ class MRAConfiguration(models.Model):
         ('receipt_format', 'Receipt Format'),
         ('product_codes', 'Product Codes'),
         ('system_settings', 'System Settings'),
+        ('global_configuration', 'MRA Global Configuration'),
+        ('terminal_configuration', 'MRA Terminal Configuration'),
+        ('taxpayer_configuration', 'MRA Taxpayer Configuration'),
+        ('terminal_site_products', 'MRA Terminal Site Products'),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -288,6 +329,10 @@ class ConfigurationSyncLog(models.Model):
     def __str__(self):
         return f"Config Sync - {self.status}"
 
+    def save(self, *args, **kwargs):
+        self.error_message = redact_sensitive_text(self.error_message)
+        super().save(*args, **kwargs)
+
 
 # ============================================================================
 # 3. PRODUCT & STOCK MAPPING
@@ -295,8 +340,10 @@ class ConfigurationSyncLog(models.Model):
 
 class MRAProductMapping(models.Model):
     """
-    Maps internal products to MRA product codes and tax categories.
-    Enforces MRA-approved products only.
+    Legacy product mapping table retained for migration/data compatibility.
+
+    Active POS/EIS mapping now lives in inventory.MRAProductMapping because it
+    links directly to InventoryItem and branch-scoped sales.
     """
     TAX_CATEGORIES = [
         ('standard', 'Standard Rated (16.5%)'),
@@ -380,7 +427,12 @@ class MRAInvoice(models.Model):
     
     # Invoice identification (immutable)
     invoice_number = models.BigIntegerField(
-        help_text="Sequential invoice number per terminal"
+        help_text="Sequential invoice number per terminal fiscal day"
+    )
+    fiscal_julian_date = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="MRA Julian date used with invoice_number for daily fiscal sequencing"
     )
     mra_invoice_id = models.CharField(
         max_length=255,
@@ -448,11 +500,12 @@ class MRAInvoice(models.Model):
             models.Index(fields=['business', 'branch']),
             models.Index(fields=['terminal', 'invoice_number']),
             models.Index(fields=['terminal', 'invoice_number', 'is_online']),
+            models.Index(fields=['terminal', 'fiscal_julian_date', 'invoice_number']),
             models.Index(fields=['status']),
             models.Index(fields=['invoice_date']),
             models.Index(fields=['seller_tin']),
         ]
-        unique_together = ('terminal', 'invoice_number', 'is_online')
+        unique_together = ('terminal', 'fiscal_julian_date', 'invoice_number')
 
     def __str__(self):
         return f"Invoice #{self.invoice_number} - {self.status}"
@@ -477,6 +530,10 @@ class MRAInvoice(models.Model):
         }
         signature_string = json.dumps(signature_data, sort_keys=True)
         return hashlib.sha256(signature_string.encode()).hexdigest()
+
+    def save(self, *args, **kwargs):
+        self.mra_response = redact_sensitive_data(self.mra_response)
+        super().save(*args, **kwargs)
 
 
 # ============================================================================
@@ -542,6 +599,10 @@ class OfflineInvoiceQueue(models.Model):
         """Expose MRA-required sync state naming without altering stored status values."""
         return self.SYNC_STATE_MAP.get(self.status, 'PENDING')
 
+    def save(self, *args, **kwargs):
+        self.last_sync_error = redact_sensitive_text(self.last_sync_error)
+        super().save(*args, **kwargs)
+
 
 class OfflineAuditLog(models.Model):
     """
@@ -575,6 +636,10 @@ class OfflineAuditLog(models.Model):
 
     def __str__(self):
         return f"{self.event_type} - {self.terminal.terminal_id}"
+
+    def save(self, *args, **kwargs):
+        self.details = redact_sensitive_data(self.details)
+        super().save(*args, **kwargs)
 
 
 # ============================================================================
@@ -669,6 +734,10 @@ class InvoiceAuditLog(models.Model):
     def __str__(self):
         return f"{self.action} - Invoice {self.mra_invoice.invoice_number}"
 
+    def save(self, *args, **kwargs):
+        self.details = redact_sensitive_data(self.details)
+        super().save(*args, **kwargs)
+
 
 class TerminalAuditLog(models.Model):
     """
@@ -679,6 +748,7 @@ class TerminalAuditLog(models.Model):
         ('token_refreshed', 'Token Refreshed'),
         ('online_status_changed', 'Online Status Changed'),
         ('configuration_updated', 'Configuration Updated'),
+        ('mra_request_signed', 'MRA Request Signed'),
         ('suspended', 'Terminal Suspended'),
         ('deactivated', 'Terminal Deactivated'),
     ]
@@ -704,6 +774,10 @@ class TerminalAuditLog(models.Model):
 
     def __str__(self):
         return f"{self.action} - {self.terminal.terminal_id}"
+
+    def save(self, *args, **kwargs):
+        self.details = redact_sensitive_data(self.details)
+        super().save(*args, **kwargs)
 
 
 # ============================================================================
@@ -762,6 +836,10 @@ class MRAAPIError(models.Model):
     def __str__(self):
         return f"{self.error_type} - {self.error_message[:50]}"
 
+    def save(self, *args, **kwargs):
+        self.error_message = redact_sensitive_text(self.error_message)
+        super().save(*args, **kwargs)
+
     def should_retry(self):
         """Check if error should be retried"""
         return (
@@ -778,9 +856,15 @@ class SyncRetryQueue(models.Model):
     """
     OPERATION_TYPES = [
         ('submit_invoice', 'Submit Invoice'),
+        ('submit_pos_order', 'Submit POS Order'),
         ('sync_offline_invoices', 'Sync Offline Invoices'),
         ('refresh_token', 'Refresh Token'),
         ('fetch_configuration', 'Fetch Configuration'),
+        ('submit_credit_note', 'Submit Credit Note'),
+        ('submit_debit_note', 'Submit Debit Note'),
+        ('submit_void_transaction', 'Submit Void Transaction'),
+        ('submit_stock_payload', 'Submit Stock Payload'),
+        ('submit_purchase_item_receipt', 'Submit Purchase Item Receipt'),
     ]
 
     STATUS_CHOICES = [

@@ -1,12 +1,26 @@
 from rest_framework import serializers
 from django.db import transaction
-from .models import Session, Order, OrderItem
+from django.core.exceptions import ValidationError as DjangoValidationError
+from .models import Session, Order, OrderItem, DiscountRule
 from .tax_utils import (
     calculate_tax_snapshot,
     get_default_tax_rate,
     lock_tax_rate_on_use,
 )
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+
+def _to_decimal(value, default=Decimal('0')):
+    if value in (None, ''):
+        return default
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return default
+
+
+def _money(value):
+    return _to_decimal(value).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
 
 class OrderItemSerializer(serializers.ModelSerializer):
@@ -20,6 +34,11 @@ class OrderItemSerializer(serializers.ModelSerializer):
             'quantity',
             'price',
             'notes',
+            'discount_rule_id',
+            'discount_name',
+            'discount_type',
+            'discount_value',
+            'discount_amount',
             # MRA PRODUCT MAPPING
             'mra_product_code',
             'vat_category',
@@ -57,6 +76,11 @@ class OrderItemSerializer(serializers.ModelSerializer):
             'taxType': 'tax_type',
             'taxCalculationMethod': 'tax_calculation_method',
             'taxAmount': 'tax_amount',
+            'discountRuleId': 'discount_rule_id',
+            'discountName': 'discount_name',
+            'discountType': 'discount_type',
+            'discountValue': 'discount_value',
+            'discountAmount': 'discount_amount',
         }
 
         converted_data = {}
@@ -68,6 +92,38 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
         converted_data['inventory_item_id'] = inventory_item_id
         return super().to_internal_value(converted_data)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        quantity = _to_decimal(attrs.get('quantity'))
+        price = _to_decimal(attrs.get('price'))
+        line_amount = _money(price * quantity)
+        if line_amount <= 0:
+            line_amount = _money(
+                _to_decimal(attrs.get('subtotal')) + _to_decimal(attrs.get('tax_amount'))
+            )
+        if line_amount <= 0:
+            line_amount = _money(attrs.get('total'))
+
+        discount_type = str(attrs.get('discount_type') or '').strip().lower()
+        discount_value = _money(attrs.get('discount_value'))
+        discount_amount = _money(attrs.get('discount_amount'))
+
+        if discount_type == 'percentage' and discount_value >= Decimal('100'):
+            raise serializers.ValidationError({
+                'discount_value': 'Discount must be less than 100%.',
+            })
+        if line_amount > 0 and discount_type == 'fixed' and discount_value >= line_amount:
+            raise serializers.ValidationError({
+                'discount_value': 'Fixed discount must be less than the item total.',
+            })
+        if line_amount > 0 and discount_amount >= line_amount and discount_amount > 0:
+            raise serializers.ValidationError({
+                'discount_amount': 'Discount must be less than the item total.',
+            })
+
+        return attrs
 
 
 class OrderSerializer(serializers.ModelSerializer):
@@ -94,7 +150,16 @@ class OrderSerializer(serializers.ModelSerializer):
             'customer_notes',
             'buyer_name',
             'buyer_tin',
+            'buyer_authorization_code',
+            'is_export',
+            'is_relief_supply',
+            'vat5_project_number',
+            'vat5_certificate_number',
+            'vat5_quantity',
+            'eis_validation_metadata',
             'subtotal',
+            'discount_amount',
+            'discount_metadata',
             'total',
             'cogs',
             # Tax snapshot fields (MRA compliance)
@@ -117,9 +182,15 @@ class OrderSerializer(serializers.ModelSerializer):
             'updated_at',
             'items'
         ]
-        read_only_fields = ['created_at', 'updated_at', 'business', 'fiscal_invoice_number', 'eis_uuid', 'eis_submitted_at', 'qr_code_payload', 'digital_signature', 'is_fiscal_locked']
+        read_only_fields = ['created_at', 'updated_at', 'business', 'fiscal_invoice_number', 'eis_uuid', 'eis_submitted_at', 'qr_code_payload', 'digital_signature', 'is_fiscal_locked', 'eis_validation_metadata']
 
     def get_eis_sync_state(self, obj):
+        metadata = obj.eis_validation_metadata if isinstance(obj.eis_validation_metadata, dict) else {}
+        submission = metadata.get('mra_submission') if isinstance(metadata.get('mra_submission'), dict) else {}
+        submission_state = str(submission.get('state') or '').strip().lower()
+        if submission_state == 'offline_queued' or bool(submission.get('queued_offline')):
+            return 'OFFLINE_QUEUED'
+
         status = str(getattr(obj, 'eis_status', '') or '').upper()
         return {
             'PENDING': 'PENDING',
@@ -146,8 +217,16 @@ class OrderSerializer(serializers.ModelSerializer):
             'customerNotes': 'customer_notes',
             'buyerName': 'buyer_name',
             'buyerTin': 'buyer_tin',
+            'buyerAuthorizationCode': 'buyer_authorization_code',
+            'isExport': 'is_export',
+            'isReliefSupply': 'is_relief_supply',
+            'vat5ProjectNumber': 'vat5_project_number',
+            'vat5CertificateNumber': 'vat5_certificate_number',
+            'vat5Quantity': 'vat5_quantity',
             'createdAt': 'created_at',
             'updatedAt': 'updated_at',
+            'discountAmount': 'discount_amount',
+            'discountMetadata': 'discount_metadata',
         }
         
         # Convert camelCase keys to snake_case
@@ -229,6 +308,60 @@ class OrderSerializer(serializers.ModelSerializer):
             return order
 
 
+class DiscountRuleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DiscountRule
+        fields = [
+            'id',
+            'business',
+            'branch',
+            'name',
+            'discount_type',
+            'value',
+            'applies_to',
+            'product_ids',
+            'categories',
+            'starts_at',
+            'ends_at',
+            'is_active',
+            'requires_manager_approval',
+            'created_by',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'created_by', 'created_at', 'updated_at']
+
+    def to_internal_value(self, data):
+        field_mapping = {
+            'discountType': 'discount_type',
+            'appliesTo': 'applies_to',
+            'productIds': 'product_ids',
+            'startsAt': 'starts_at',
+            'endsAt': 'ends_at',
+            'isActive': 'is_active',
+            'requiresManagerApproval': 'requires_manager_approval',
+        }
+        converted_data = {}
+        for key, value in data.items():
+            converted_data[field_mapping.get(key, key)] = value
+        return super().to_internal_value(converted_data)
+
+    def validate(self, attrs):
+        candidate = {}
+        for field in DiscountRule._meta.fields:
+            if field.name in {'id', 'created_at', 'updated_at'}:
+                continue
+            if self.instance is not None:
+                candidate[field.name] = getattr(self.instance, field.name)
+        candidate.update(attrs)
+        instance = DiscountRule(**candidate)
+        try:
+            instance.clean()
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.message_dict if hasattr(exc, 'message_dict') else exc.messages)
+        return attrs
+
+
 class SessionSerializer(serializers.ModelSerializer):
     orders = OrderSerializer(many=True, read_only=True)
     user_name = serializers.SerializerMethodField()
@@ -307,7 +440,7 @@ class SessionSerializer(serializers.ModelSerializer):
         total = Order.objects.filter(
             session=obj,
             status__in=['New', 'Preparing', 'Ready', 'Completed']
-        ).aggregate(Sum('total'))['total__sum'] or Decimal('0')
+        ).aggregate(Sum('subtotal'))['subtotal__sum'] or Decimal('0')
         return float(total)
     
     def get_total_cash_sales(self, obj):
@@ -361,7 +494,11 @@ class SessionSerializer(serializers.ModelSerializer):
         return float(total)
     
     def get_total_tips(self, obj):
-        """Calculate total tips - tips are not affected by voided orders"""
+        """Return the session's synced tip total.
+
+        Tips are tracked on the session aggregate because the backend Order model
+        no longer stores a per-order tip field.
+        """
         return float(obj.total_tips or 0)
     
     def get_expected_cash(self, obj):

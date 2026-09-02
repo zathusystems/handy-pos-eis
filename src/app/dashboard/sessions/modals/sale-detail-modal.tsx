@@ -743,7 +743,7 @@ export default function SaleDetailModal({ order, isOpen, onOpenChange }: { order
   return (
     <>
       <Dialog open={isOpen} onOpenChange={onOpenChange}>
-        <DialogContent className="flex max-h-[95dvh] w-[calc(100vw-0.75rem)] max-w-4xl flex-col overflow-hidden p-4 sm:w-[95vw] sm:p-6">
+        <DialogContent className="flex max-h-[95vh] max-h-[95dvh] w-[calc(100vw-0.75rem)] max-w-4xl flex-col overflow-hidden p-4 sm:w-[95vw] sm:p-6">
           <DialogHeader className="gap-3 pr-8 text-left sm:flex-row sm:items-start sm:justify-between">
             <div className="flex-1">
               <DialogTitle>Order #{order.orderNumber} Details</DialogTitle>

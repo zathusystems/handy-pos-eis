@@ -8,6 +8,27 @@ from .models import InventoryItem, WasteRecord, AuditLog
 from business.models import Business, Branch
 
 
+def _submit_eis_inventory_adjustment(*, business, branch, inventory_item, quantity, adjustment_type, reason, remarks=''):
+    """Submit an EIS stock adjustment without blocking local waste sync."""
+    try:
+        from mra_eis.services import StockReceivingService
+
+        result = StockReceivingService.submit_inventory_item_adjustment(
+            business=business,
+            branch=branch,
+            inventory_item=inventory_item,
+            quantity=quantity,
+            adjustment_type=adjustment_type,
+            reason=reason,
+            remarks=remarks,
+        )
+        print(f"[Sync Waste] EIS stock adjustment result for {inventory_item.id}: {result}")
+        return result
+    except Exception as exc:
+        print(f"[Sync Waste] Warning: EIS stock adjustment failed for {inventory_item.id}: {exc}")
+        return {'submitted': False, 'error': str(exc)}
+
+
 def handle_create_waste_record(waste_id, data, business, branch_id):
     """Handle creation of waste record from frontend"""
     try:
@@ -114,10 +135,21 @@ def handle_create_waste_record(waste_id, data, business, branch_id):
                 }
             )
             print(f"[Sync Waste] Logged audit action for waste record {waste_id}")
+
+        eis_stock_sync = _submit_eis_inventory_adjustment(
+            business=business,
+            branch=branch,
+            inventory_item=inventory_item,
+            quantity=quantity_wasted,
+            adjustment_type='Decrease',
+            reason=f"Waste: {data.get('reason', 'Other')}",
+            remarks=f"Waste record {waste_id}: {data.get('notes', '')}",
+        )
         
         return {
             'success': True,
-            'server_id': str(waste.id)
+            'server_id': str(waste.id),
+            'eis_stock_sync': eis_stock_sync,
         }
         
     except Exception as e:
@@ -137,6 +169,8 @@ def handle_update_waste_record(waste_id, data, business, branch_id):
         
         waste = WasteRecord.objects.get(id=waste_id, business=business)
         
+        eis_stock_sync = None
+        eis_adjustment_kwargs = None
         with transaction.atomic():
             # Track old quantity for inventory adjustment
             old_quantity = waste.quantity
@@ -203,10 +237,35 @@ def handle_update_waste_record(waste_id, data, business, branch_id):
                     }
                 )
                 print(f"[Sync Waste] Logged audit action for waste record update {waste_id}")
+
+                if quantity_difference > 0:
+                    eis_adjustment_kwargs = {
+                        'business': business,
+                        'branch': waste.branch,
+                        'inventory_item': inventory_item,
+                        'quantity': quantity_difference,
+                        'adjustment_type': 'Decrease',
+                        'reason': f"Waste increased: {waste.reason}",
+                        'remarks': f"Waste record {waste_id} quantity increased.",
+                    }
+                elif quantity_difference < 0:
+                    eis_adjustment_kwargs = {
+                        'business': business,
+                        'branch': waste.branch,
+                        'inventory_item': inventory_item,
+                        'quantity': -quantity_difference,
+                        'adjustment_type': 'Increase',
+                        'reason': f"Waste reduced: {waste.reason}",
+                        'remarks': f"Waste record {waste_id} quantity reduced.",
+                    }
+
+        if eis_adjustment_kwargs:
+            eis_stock_sync = _submit_eis_inventory_adjustment(**eis_adjustment_kwargs)
         
         return {
             'success': True,
-            'server_id': str(waste.id)
+            'server_id': str(waste.id),
+            'eis_stock_sync': eis_stock_sync,
         }
         
     except WasteRecord.DoesNotExist:
@@ -227,6 +286,8 @@ def handle_delete_waste_record(waste_id, business, branch_id):
     try:
         waste = WasteRecord.objects.get(id=waste_id, business=business)
         
+        eis_stock_sync = None
+        eis_adjustment_kwargs = None
         with transaction.atomic():
             # Reverse the batch update if linked
             if waste.purchase_order_item:
@@ -243,6 +304,15 @@ def handle_delete_waste_record(waste_id, business, branch_id):
             inventory_item.update_status()
             inventory_item.save()
             print(f"[Sync Waste] Reversed main inventory update for {inventory_item.id}: stock increased by {waste.quantity} ({old_stock} -> {inventory_item.stock_units})")
+            eis_adjustment_kwargs = {
+                'business': business,
+                'branch': waste.branch,
+                'inventory_item': inventory_item,
+                'quantity': waste.quantity,
+                'adjustment_type': 'Increase',
+                'reason': f"Waste reversed: {waste.reason}",
+                'remarks': f"Waste record {waste_id} deleted.",
+            }
             
             # Log audit action for deletion
             AuditLog.objects.create(
@@ -265,10 +335,14 @@ def handle_delete_waste_record(waste_id, business, branch_id):
             
             waste.delete()
             print(f"[Sync Waste] Deleted waste record {waste_id}")
+
+        if eis_adjustment_kwargs:
+            eis_stock_sync = _submit_eis_inventory_adjustment(**eis_adjustment_kwargs)
         
         return {
             'success': True,
-            'server_id': waste_id
+            'server_id': waste_id,
+            'eis_stock_sync': eis_stock_sync,
         }
         
     except WasteRecord.DoesNotExist:

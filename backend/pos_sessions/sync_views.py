@@ -27,7 +27,48 @@ NON_BLOCKING_OFFLINE_DRY_RUN_REASONS = {
     'timeout',
     'network_error',
     'eis_unreachable',
+    'mra_server_error',
 }
+
+
+class InsufficientStockError(ValueError):
+    """Raised when a sale would consume more stock than is available."""
+
+    def __init__(self, product_name, requested, available):
+        self.product_name = str(product_name or 'Product')
+        self.requested = requested
+        self.available = available
+        super().__init__(
+            f'Insufficient stock for {self.product_name}: '
+            f'requested {_format_stock_quantity(requested)}, '
+            f'available {_format_stock_quantity(available)}.'
+        )
+
+
+class InvalidDiscountError(ValueError):
+    """Raised when a discount would make a sale line zero or negative."""
+
+    def __init__(self, product_name, discount_amount, line_amount):
+        self.product_name = str(product_name or 'Product')
+        self.discount_amount = discount_amount
+        self.line_amount = line_amount
+        super().__init__(
+            f'Discount for {self.product_name} must be less than the item total. '
+            f'Discount {_format_money(discount_amount)} cannot be applied to '
+            f'item total {_format_money(line_amount)}.'
+        )
+
+
+def _format_stock_quantity(value):
+    quantity = _to_decimal(value, Decimal('0')).quantize(Decimal('0.001'), rounding=ROUND_HALF_UP)
+    text = format(quantity, 'f')
+    if '.' in text:
+        text = text.rstrip('0').rstrip('.')
+    return text or '0'
+
+
+def _format_money(value):
+    return format(_quantize_money(value), ',.2f')
 
 def _to_optional_decimal(value):
     """Parse optional numeric payload values safely."""
@@ -45,6 +86,14 @@ def _to_decimal(value, default=Decimal('0')):
     return parsed if parsed is not None else default
 
 
+def _parse_bool(value, default=False):
+    if value in (None, '', 'null', 'undefined'):
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+
+
 def _resolve_line_base_amount(item_data, tax_calculation_method='inclusive'):
     """
     Resolve the pre-tax line amount basis from mixed client payloads.
@@ -56,6 +105,14 @@ def _resolve_line_base_amount(item_data, tax_calculation_method='inclusive'):
     quantity = _to_decimal(item_data.get('quantity'), Decimal('0'))
     price = _to_decimal(item_data.get('price'), Decimal('0'))
 
+    explicit_original_line = (
+        _to_optional_decimal(item_data.get('lineAmountBeforeDiscount'))
+        or _to_optional_decimal(item_data.get('line_amount_before_discount'))
+        or _to_optional_decimal(item_data.get('originalLineAmount'))
+        or _to_optional_decimal(item_data.get('original_line_amount'))
+        or _to_optional_decimal(item_data.get('grossBeforeDiscount'))
+        or _to_optional_decimal(item_data.get('gross_before_discount'))
+    )
     explicit_subtotal = _to_optional_decimal(item_data.get('subtotal'))
     explicit_tax = _to_optional_decimal(item_data.get('taxAmount'))
     if explicit_tax is None:
@@ -67,7 +124,9 @@ def _resolve_line_base_amount(item_data, tax_calculation_method='inclusive'):
 
     if method == 'exclusive':
         # For exclusive tax, base is net/subtotal before tax.
-        if explicit_subtotal is not None and explicit_subtotal >= 0:
+        if explicit_original_line is not None and explicit_original_line >= 0:
+            line_base = explicit_original_line
+        elif explicit_subtotal is not None and explicit_subtotal >= 0:
             line_base = explicit_subtotal
         elif explicit_total is not None and explicit_tax is not None:
             line_base = explicit_total - explicit_tax
@@ -75,7 +134,9 @@ def _resolve_line_base_amount(item_data, tax_calculation_method='inclusive'):
             line_base = explicit_total
     else:
         # For inclusive tax, base is gross/total (price already includes tax).
-        if explicit_total is not None and explicit_total >= 0:
+        if explicit_original_line is not None and explicit_original_line >= 0:
+            line_base = explicit_original_line
+        elif explicit_total is not None and explicit_total >= 0:
             line_base = explicit_total
         elif explicit_subtotal is not None and explicit_tax is not None:
             line_base = explicit_subtotal + explicit_tax
@@ -86,6 +147,44 @@ def _resolve_line_base_amount(item_data, tax_calculation_method='inclusive'):
         line_base = quantity * price
 
     return max(Decimal('0'), line_base)
+
+
+def _resolve_line_discount_amount(item_data, line_base_amount):
+    line_base_amount = _quantize_money(line_base_amount)
+    item_name = item_data.get('name') or item_data.get('description') or 'Product'
+    discount_amount = _to_decimal(
+        item_data.get('discountAmount')
+        if item_data.get('discountAmount') is not None
+        else item_data.get('discount_amount'),
+        Decimal('0'),
+    )
+    discount_type = str(
+        item_data.get('discountType')
+        or item_data.get('discount_type')
+        or ''
+    ).strip().lower()
+    discount_value = _to_decimal(
+        item_data.get('discountValue')
+        if item_data.get('discountValue') is not None
+        else item_data.get('discount_value'),
+        Decimal('0'),
+    )
+
+    if discount_amount <= 0 and discount_type == 'percentage' and discount_value > 0:
+        discount_amount = Decimal(str(line_base_amount or 0)) * discount_value / Decimal('100')
+
+    if discount_amount <= 0:
+        return Decimal('0.00')
+
+    discount_amount = _quantize_money(discount_amount)
+    if discount_type == 'percentage' and discount_value >= Decimal('100'):
+        raise InvalidDiscountError(item_name, discount_amount, line_base_amount)
+    if discount_type == 'fixed' and discount_value >= line_base_amount:
+        raise InvalidDiscountError(item_name, _quantize_money(discount_value), line_base_amount)
+    if discount_amount >= line_base_amount:
+        raise InvalidDiscountError(item_name, discount_amount, line_base_amount)
+
+    return discount_amount
 
 
 def _normalize_tax_type(value):
@@ -99,6 +198,27 @@ def _normalize_tax_type(value):
 
 def _quantize_money(value):
     return Decimal(str(value or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+
+
+def _mapping_uses_standard_vat(tax_type, tax_rate) -> bool:
+    normalized_tax_type = _normalize_tax_type(tax_type)
+    rate = _to_decimal(tax_rate, Decimal('0'))
+    return normalized_tax_type == 'standard' and rate > 0
+
+
+def _is_eis_taxpayer_non_vat(business) -> bool:
+    try:
+        from mra_eis.services import ConfigurationService
+
+        return ConfigurationService.is_taxpayer_explicitly_non_vat(business)
+    except Exception:
+        taxpayer_type = str(getattr(business, 'mra_taxpayer_type', '') or '').strip().upper().replace('-', '_')
+        if taxpayer_type in {'NON_VAT', 'NONVAT', 'NON_VAT_REGISTERED'}:
+            return True
+        if taxpayer_type == 'VAT':
+            return False
+        return getattr(business, 'vat_registered', None) is False
 
 
 def _calculate_item_tax_values(line_base_amount, tax_type='standard', tax_rate=Decimal('0'), tax_calculation_method='inclusive'):
@@ -175,6 +295,18 @@ def _build_order_sync_payload(order):
         'customer_notes': order.customer_notes,
         'buyer_name': order.buyer_name,
         'buyer_tin': order.buyer_tin,
+        'buyer_authorization_code': order.buyer_authorization_code,
+        'is_export': order.is_export,
+        'is_relief_supply': order.is_relief_supply,
+        'vat5_project_number': order.vat5_project_number,
+        'vat5_certificate_number': order.vat5_certificate_number,
+        'vat5_quantity': float(order.vat5_quantity) if order.vat5_quantity is not None else None,
+        'eis_validation_metadata': order.eis_validation_metadata,
+        'mra_submission': (
+            order.eis_validation_metadata.get('mra_submission')
+            if isinstance(order.eis_validation_metadata, dict)
+            else None
+        ),
         'fiscal_invoice_number': order.fiscal_invoice_number,
         'eis_status': order.eis_status,
         'eis_uuid': order.eis_uuid,
@@ -204,6 +336,11 @@ def _get_mra_submission_block_reason(mra_result):
     if not isinstance(mra_result, dict):
         return 'MRA EIS submission did not return a valid response.'
 
+    submission_message = str(mra_result.get('submission_message') or '').strip()
+    submission_state = str(mra_result.get('submission_state') or '').strip()
+    if submission_state in {'accepted', 'offline_queued'}:
+        return None
+
     endpoint_key = str(mra_result.get('endpoint') or '').strip().lower()
 
     response_payload = mra_result.get('response')
@@ -220,10 +357,14 @@ def _get_mra_submission_block_reason(mra_result):
         return None
 
     if mra_result.get('dry_run'):
+        if submission_message:
+            return submission_message
         return f'MRA EIS unavailable ({reason}).'
 
     eis_status = str(mra_result.get('eis_status') or '').upper()
     if eis_status != 'SUBMITTED':
+        if submission_message:
+            return submission_message
         return f'MRA EIS did not confirm submission (status: {eis_status or "UNKNOWN"}).'
 
     return None
@@ -254,6 +395,12 @@ def sync_push(request):
         last_synced_at = request.data.get('last_synced_at')
         branch_id = request.data.get('branch_id')
         changes = request.data.get('changes', [])
+        try:
+            from mra_eis.services import TerminalService
+
+            request_device_serial = TerminalService.extract_request_device_serial(request)
+        except Exception:
+            request_device_serial = ''
         
         print(f"[Sync Push Sessions] Received {len(changes)} changes from frontend")
         print(f"[Sync Push Sessions] Last synced: {last_synced_at}, Branch: {branch_id}")
@@ -297,9 +444,23 @@ def sync_push(request):
                             continue
                     elif entity_type == 'Order':
                         if operation == 'create':
-                            result = handle_create_order(entity_id, data, business, branch_id, request.user)
+                            result = handle_create_order(
+                                entity_id,
+                                data,
+                                business,
+                                branch_id,
+                                request.user,
+                                request_device_serial=request_device_serial,
+                            )
                         elif operation == 'update':
-                            result = handle_update_order(entity_id, data, business, branch_id, request.user)
+                            result = handle_update_order(
+                                entity_id,
+                                data,
+                                business,
+                                branch_id,
+                                request.user,
+                                request_device_serial=request_device_serial,
+                            )
                         elif operation == 'delete':
                             result = handle_delete_order(entity_id, business, branch_id)
                         else:
@@ -332,6 +493,14 @@ def sync_push(request):
                             'customer_notes',
                             'buyer_name',
                             'buyer_tin',
+                            'buyer_authorization_code',
+                            'is_export',
+                            'is_relief_supply',
+                            'vat5_project_number',
+                            'vat5_certificate_number',
+                            'vat5_quantity',
+                            'eis_validation_metadata',
+                            'mra_submission',
                             'fiscal_invoice_number',
                             'eis_status',
                             'eis_uuid',
@@ -349,10 +518,15 @@ def sync_push(request):
                         results['acknowledged'].append(ack_payload)
                         print(f"[Sync Push Sessions] Successfully processed {operation} for {entity_id}")
                     else:
-                        results['errors'].append({
+                        error_payload = {
                             'id': entity_id,
                             'error': result.get('error', 'Unknown error')
-                        })
+                        }
+                        if result.get('reason'):
+                            error_payload['reason'] = result.get('reason')
+                        if result.get('mra_submission'):
+                            error_payload['mra_submission'] = result.get('mra_submission')
+                        results['errors'].append(error_payload)
                         print(f"[Sync Push Sessions] Error processing {operation} for {entity_id}: {result.get('error')}")
                         
                 except Exception as e:
@@ -674,7 +848,7 @@ def handle_delete_session(session_id, business, branch_id):
         }
 
 
-def handle_create_order(order_id, data, business, branch_id, user):
+def handle_create_order(order_id, data, business, branch_id, user, *, request_device_serial=''):
     """Handle creation of order from frontend"""
     from business.models import Branch
     from django.db import IntegrityError
@@ -701,6 +875,7 @@ def handle_create_order(order_id, data, business, branch_id, user):
             }
         
         business_settings = getattr(business, 'settings', None)
+        eis_enabled = bool(getattr(business_settings, 'enable_eis', False))
         block_sales_if_tax_mapping_missing = bool(
             getattr(business_settings, 'block_sales_if_tax_mapping_missing', False)
         )
@@ -712,7 +887,6 @@ def handle_create_order(order_id, data, business, branch_id, user):
             unmapped_products = []
             unapproved_products = []
             unsynced_products = []
-            
             for item_data in data['items']:
                 # The item_data contains 'inventoryItemId' which is the actual inventory item ID
                 # NOT the order item ID (which is in 'id')
@@ -736,6 +910,14 @@ def handle_create_order(order_id, data, business, branch_id, user):
 
                     if approved_and_synced:
                         print(f"[Sync Sessions] ✓ Product {item_name} ({item_id}) has approved+synced MRA mapping")
+                        if _mapping_uses_standard_vat(
+                            approved_and_synced.mra_tax_type,
+                            approved_and_synced.mra_tax_rate,
+                        ):
+                            print(
+                                f"[Sync Sessions] ℹ Product {item_name} ({item_id}) uses MRA-approved "
+                                f"standard VAT ({approved_and_synced.mra_tax_rate}%). Keeping MRA tax metadata."
+                            )
                     elif approved_but_unsynced:
                         print(f"[Sync Sessions] ⚠ Product {item_name} ({item_id}) mapping is approved but NOT synced")
                         unsynced_products.append(item_name)
@@ -776,6 +958,7 @@ def handle_create_order(order_id, data, business, branch_id, user):
                     'success': False,
                     'error': error_msg
                 }
+
 
         if block_sales_if_tax_mapping_missing:
             print(f"[Sync Sessions] ✓ All products have approved+synced MRA mappings - proceeding with order creation")
@@ -848,7 +1031,7 @@ def handle_create_order(order_id, data, business, branch_id, user):
             print(f"[Sync Sessions] Items have complete price data: {items_have_complete_price_data}")
         
         default_tax_rate = None
-        if not block_sales_if_tax_mapping_missing:
+        if not eis_enabled and not block_sales_if_tax_mapping_missing:
             default_tax_rate = TaxRate.objects.filter(
                 business=business,
                 is_active=True,
@@ -871,7 +1054,10 @@ def handle_create_order(order_id, data, business, branch_id, user):
                 item_quantity = _to_decimal(item_data.get('quantity'), Decimal('0'))
                 item_price = _to_decimal(item_data.get('price'), Decimal('0'))
                 
-                print(f"[Sync Sessions] Processing item {item_id}: qty={item_quantity}, price={item_price}")
+                print(
+                    f"[Sync Sessions] Processing item {item_id}: "
+                    f"qty={item_quantity}, price={item_price}"
+                )
                 
                 try:
                     # Get MRA mapping for this product
@@ -886,8 +1072,10 @@ def handle_create_order(order_id, data, business, branch_id, user):
                         tax_rate = _to_decimal(mra_mapping.mra_tax_rate, Decimal('0'))
                         tax_type = _normalize_tax_type(mra_mapping.mra_tax_type)
                         line_base_amount = _resolve_line_base_amount(item_data, tax_calculation_method)
+                        discount_amount = _resolve_line_discount_amount(item_data, line_base_amount)
+                        discounted_line_base_amount = max(Decimal('0'), line_base_amount - discount_amount)
                         tax_values = _calculate_item_tax_values(
-                            line_base_amount=line_base_amount,
+                            line_base_amount=discounted_line_base_amount,
                             tax_type=tax_type,
                             tax_rate=tax_rate,
                             tax_calculation_method=tax_calculation_method,
@@ -895,7 +1083,8 @@ def handle_create_order(order_id, data, business, branch_id, user):
 
                         print(
                             f"[Sync Sessions] Found MRA mapping for {item_id}: "
-                            f"method={tax_calculation_method}, rate={tax_rate}%, tax_type={tax_type}, base={line_base_amount}"
+                            f"method={tax_calculation_method}, rate={tax_rate}%, tax_type={tax_type}, "
+                            f"base={line_base_amount}, discount={discount_amount}"
                         )
 
                         total_vat += tax_values['tax_amount']
@@ -916,18 +1105,24 @@ def handle_create_order(order_id, data, business, branch_id, user):
                             item_data.get('taxType') or item_data.get('tax_type') or 'standard'
                         )
 
-                        if not block_sales_if_tax_mapping_missing and fallback_tax_rate <= 0 and fallback_tax_type == 'standard' and default_tax_rate:
+                        if eis_enabled:
+                            fallback_tax_rate = Decimal('0')
+                            fallback_tax_type = 'standard'
+                            fallback_method = 'inclusive'
+                        elif not block_sales_if_tax_mapping_missing and fallback_tax_rate <= 0 and fallback_tax_type == 'standard' and default_tax_rate:
                             fallback_tax_rate = _to_decimal(default_tax_rate.rate, Decimal('0'))
                             fallback_tax_type = _normalize_tax_type(default_tax_rate.tax_type)
 
                         line_base_amount = _resolve_line_base_amount(item_data, fallback_method)
+                        discount_amount = _resolve_line_discount_amount(item_data, line_base_amount)
+                        discounted_line_base_amount = max(Decimal('0'), line_base_amount - discount_amount)
                         print(
                             f"[Sync Sessions] No MRA mapping found for {item_id}, "
                             f"using fallback tax: type={fallback_tax_type}, rate={fallback_tax_rate}%, method={fallback_method}, "
-                            f"base={line_base_amount}"
+                            f"base={line_base_amount}, discount={discount_amount}"
                         )
                         fallback_values = _calculate_item_tax_values(
-                            line_base_amount=line_base_amount,
+                            line_base_amount=discounted_line_base_amount,
                             tax_type=fallback_tax_type,
                             tax_rate=fallback_tax_rate,
                             tax_calculation_method=fallback_method,
@@ -951,13 +1146,19 @@ def handle_create_order(order_id, data, business, branch_id, user):
                     fallback_tax_type = _normalize_tax_type(
                         item_data.get('taxType') or item_data.get('tax_type') or 'standard'
                     )
-                    if not block_sales_if_tax_mapping_missing and fallback_tax_rate <= 0 and fallback_tax_type == 'standard' and default_tax_rate:
+                    if eis_enabled:
+                        fallback_tax_rate = Decimal('0')
+                        fallback_tax_type = 'standard'
+                        fallback_method = 'inclusive'
+                    elif not block_sales_if_tax_mapping_missing and fallback_tax_rate <= 0 and fallback_tax_type == 'standard' and default_tax_rate:
                         fallback_tax_rate = _to_decimal(default_tax_rate.rate, Decimal('0'))
                         fallback_tax_type = _normalize_tax_type(default_tax_rate.tax_type)
 
                     fallback_line_amount = _resolve_line_base_amount(item_data, fallback_method)
+                    fallback_discount_amount = _resolve_line_discount_amount(item_data, fallback_line_amount)
+                    discounted_fallback_line_amount = max(Decimal('0'), fallback_line_amount - fallback_discount_amount)
                     fallback_values = _calculate_item_tax_values(
-                        line_base_amount=fallback_line_amount,
+                        line_base_amount=discounted_fallback_line_amount,
                         tax_type=fallback_tax_type,
                         tax_rate=fallback_tax_rate,
                         tax_calculation_method=fallback_method,
@@ -992,7 +1193,60 @@ def handle_create_order(order_id, data, business, branch_id, user):
             'customer_notes': data.get('customer_notes') or data.get('customerNotes'),
             'buyer_name': data.get('buyer_name') or data.get('buyerName'),
             'buyer_tin': data.get('buyer_tin') or data.get('buyerTin'),
+            'buyer_authorization_code': data.get('buyer_authorization_code') or data.get('buyerAuthorizationCode'),
+            'is_export': _parse_bool(data.get('is_export', data.get('isExport')), False),
+            'is_relief_supply': _parse_bool(data.get('is_relief_supply', data.get('isReliefSupply')), False),
+            'vat5_project_number': data.get('vat5_project_number') or data.get('vat5ProjectNumber'),
+            'vat5_certificate_number': data.get('vat5_certificate_number') or data.get('vat5CertificateNumber'),
+            'vat5_quantity': _to_decimal(
+                data.get('vat5_quantity', data.get('vat5Quantity')),
+                Decimal('0')
+            ) if data.get('vat5_quantity', data.get('vat5Quantity')) not in (None, '') else None,
             'subtotal': _quantize_money(subtotal),
+            'discount_amount': _quantize_money(
+                sum(
+                    (
+                        _resolve_line_discount_amount(
+                            item,
+                            _resolve_line_base_amount(
+                                item,
+                                item.get('taxCalculationMethod') or item.get('tax_calculation_method') or 'inclusive',
+                            ),
+                        )
+                        for item in (data.get('items') or [])
+                    ),
+                    Decimal('0'),
+                )
+            ),
+            'discount_metadata': {
+                'source': 'pos_admin_discount_rules',
+                'items': [
+                    {
+                        'inventoryItemId': item.get('inventoryItemId') or item.get('inventory_item_id') or item.get('id'),
+                        'discountRuleId': item.get('discountRuleId') or item.get('discount_rule_id'),
+                        'discountName': item.get('discountName') or item.get('discount_name'),
+                        'discountType': item.get('discountType') or item.get('discount_type'),
+                        'discountValue': item.get('discountValue') or item.get('discount_value'),
+                        'discountAmount': str(
+                            _resolve_line_discount_amount(
+                                item,
+                                _resolve_line_base_amount(
+                                    item,
+                                    item.get('taxCalculationMethod') or item.get('tax_calculation_method') or 'inclusive',
+                                ),
+                            )
+                        ),
+                    }
+                    for item in (data.get('items') or [])
+                    if _resolve_line_discount_amount(
+                        item,
+                        _resolve_line_base_amount(
+                            item,
+                            item.get('taxCalculationMethod') or item.get('tax_calculation_method') or 'inclusive',
+                        ),
+                    ) > 0
+                ],
+            },
             'total': _quantize_money(total),
             'cogs': _quantize_money(_to_decimal(data.get('cogs'), Decimal('0'))),
             'created_at': data.get('createdAt'),
@@ -1040,6 +1294,62 @@ def handle_create_order(order_id, data, business, branch_id, user):
             )
 
         order_data['session'] = active_session
+
+        if eis_enabled and order_data.get('is_relief_supply'):
+            project_number = str(order_data.get('vat5_project_number') or '').strip()
+            certificate_number = str(order_data.get('vat5_certificate_number') or '').strip()
+            quantity_value = order_data.get('vat5_quantity') or Decimal('0')
+            if not project_number or not certificate_number or quantity_value <= 0:
+                return {
+                    'success': False,
+                    'error': 'VAT5 details required.',
+                    'mra_submission': {
+                        'state': 'failed_before_order_create',
+                        'message': 'VAT5 details required.',
+                        'retryable': False,
+                    },
+                }
+            if getattr(settings, 'MRA_EIS_VALIDATE_VAT5_BEFORE_SALE', True):
+                try:
+                    from mra_eis.services import EISSaleComplianceService, MRAIntegrationError
+                    from mra_eis.services.core import _is_mra_network_failure
+
+                    vat5_validation = EISSaleComplianceService.validate_vat5_certificate(
+                        business=business,
+                        project_number=project_number,
+                        certificate_number=certificate_number,
+                        quantity=quantity_value,
+                    )
+                    if vat5_validation.get('checked') and not vat5_validation.get('is_valid'):
+                        return {
+                            'success': False,
+                            'error': 'Invalid VAT5 certificate.',
+                            'mra_submission': {
+                                'state': 'failed_before_order_create',
+                                'message': 'Invalid VAT5 certificate.',
+                                'retryable': False,
+                            },
+                        }
+                except Exception as vat5_exc:
+                    try:
+                        is_network_failure = _is_mra_network_failure(vat5_exc)
+                    except Exception:
+                        is_network_failure = False
+                    if is_network_failure:
+                        message = 'Relief sale needs MRA online.'
+                    elif isinstance(vat5_exc, MRAIntegrationError):
+                        message = str(vat5_exc)
+                    else:
+                        message = 'VAT5 validation failed.'
+                    return {
+                        'success': False,
+                        'error': message,
+                        'mra_submission': {
+                            'state': 'failed_before_order_create',
+                            'message': message,
+                            'retryable': False,
+                        },
+                    }
         
         # Remove None values
         order_data = {k: v for k, v in order_data.items() if v is not None}
@@ -1132,6 +1442,8 @@ def handle_create_order(order_id, data, business, branch_id, user):
                 item_quantity = _to_decimal(item_data.get('quantity'), Decimal('0'))
 
                 line_base_amount = _resolve_line_base_amount(item_data, tax_calculation_method)
+                item_discount_amount = _resolve_line_discount_amount(item_data, line_base_amount)
+                discounted_line_base_amount = max(Decimal('0'), line_base_amount - item_discount_amount)
 
                 mapping_for_item = MRAProductMapping.objects.filter(
                     inventory_item_id=inventory_item_id,
@@ -1142,13 +1454,17 @@ def handle_create_order(order_id, data, business, branch_id, user):
                     tax_rate = _to_decimal(mapping_for_item.mra_tax_rate, Decimal('0'))
                     tax_type = _normalize_tax_type(mapping_for_item.mra_tax_type)
                     tax_calculation_method = str(mapping_for_item.tax_calculation_method or 'inclusive').strip().lower()
+                elif eis_enabled:
+                    tax_rate = Decimal('0')
+                    tax_type = 'standard'
+                    tax_calculation_method = 'inclusive'
                 elif not block_sales_if_tax_mapping_missing and default_tax_rate:
                     if tax_type == 'standard' and tax_rate <= 0:
                         tax_rate = _to_decimal(default_tax_rate.rate, Decimal('0'))
                         tax_type = _normalize_tax_type(default_tax_rate.tax_type)
 
                 tax_values = _calculate_item_tax_values(
-                    line_base_amount=line_base_amount,
+                    line_base_amount=discounted_line_base_amount,
                     tax_type=tax_type,
                     tax_rate=tax_rate,
                     tax_calculation_method=tax_calculation_method,
@@ -1175,7 +1491,8 @@ def handle_create_order(order_id, data, business, branch_id, user):
                 print(
                     f"[Sync Sessions] OrderItem tax info - rate: {tax_rate}%, type: {tax_type}, "
                     f"method: {tax_calculation_method}, subtotal: {item_subtotal}, "
-                    f"tax: {item_tax_amount}, total: {item_total}, unit_price: {normalized_unit_price}"
+                    f"tax: {item_tax_amount}, total: {item_total}, "
+                    f"unit_price: {normalized_unit_price}"
                 )
                 
                 OrderItem.objects.create(
@@ -1185,6 +1502,16 @@ def handle_create_order(order_id, data, business, branch_id, user):
                     quantity=item_quantity.quantize(Decimal('0.001'), rounding=ROUND_HALF_UP),
                     price=normalized_unit_price.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP),
                     notes=item_data.get('notes', ''),
+                    discount_rule_id=item_data.get('discountRuleId') or item_data.get('discount_rule_id') or None,
+                    discount_name=str(item_data.get('discountName') or item_data.get('discount_name') or '')[:120],
+                    discount_type=str(item_data.get('discountType') or item_data.get('discount_type') or '')[:20],
+                    discount_value=_to_decimal(
+                        item_data.get('discountValue')
+                        if item_data.get('discountValue') is not None
+                        else item_data.get('discount_value'),
+                        Decimal('0'),
+                    ).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP),
+                    discount_amount=item_discount_amount,
                     # Per-item tax information (MRA compliance - Immutable snapshot)
                     tax_rate=tax_rate.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP),
                     tax_type=tax_type,
@@ -1221,6 +1548,24 @@ def handle_create_order(order_id, data, business, branch_id, user):
         except Exception as lock_exc:
             print(f"[Sync Sessions] Warning: tax lock update failed for order {order_id}: {lock_exc}")
 
+        try:
+            decrement_inventory_for_order(order, branch, business, validate_only=True)
+        except InsufficientStockError as stock_exc:
+            print(f"[Sync Sessions] ✗ BLOCKED order {order_id}: {stock_exc}")
+            order.delete()
+            return {
+                'success': False,
+                'error': str(stock_exc),
+                'reason': 'insufficient_stock',
+            }
+        except Exception as stock_validation_exc:
+            print(f"[Sync Sessions] ✗ BLOCKED order {order_id}: stock validation failed: {stock_validation_exc}")
+            order.delete()
+            return {
+                'success': False,
+                'error': f'Stock validation failed. Sale was not completed. Details: {stock_validation_exc}',
+            }
+
         # Prepare order for MRA EIS pipeline.
         # In live mode with block_sales_if_eis_down enabled, this becomes blocking.
         business_settings = None
@@ -1229,14 +1574,25 @@ def handle_create_order(order_id, data, business, branch_id, user):
                 business_settings = order.business.settings
             except Exception:
                 business_settings = None
-            eis_enabled = bool(getattr(business_settings, 'enable_eis', False))
             if eis_enabled:
                 from mra_eis.services import POSOrderSubmissionService
 
-                mra_result = POSOrderSubmissionService.prepare_pos_order_submission(order)
+                mra_result = POSOrderSubmissionService.prepare_pos_order_submission(
+                    order,
+                    request_device_serial=request_device_serial,
+                    enforce_device_binding=True,
+                )
+                mra_response = mra_result.get('response') if isinstance(mra_result, dict) else {}
+                mra_reason = (
+                    mra_response.get('reason')
+                    if isinstance(mra_response, dict)
+                    else ''
+                ) or '; '.join(mra_result.get('errors') or [])
                 print(
                     f"[Sync Sessions] Prepared MRA payload for order {order.id}: "
-                    f"fiscal={mra_result.get('fiscal_invoice_number')} dry_run={mra_result.get('dry_run')}"
+                    f"fiscal={mra_result.get('fiscal_invoice_number')} "
+                    f"endpoint={mra_result.get('endpoint')} "
+                    f"dry_run={mra_result.get('dry_run')} reason={mra_reason or 'none'}"
                 )
                 if _should_block_sales_if_eis_down(business_settings):
                     block_reason = _get_mra_submission_block_reason(mra_result)
@@ -1252,6 +1608,19 @@ def handle_create_order(order_id, data, business, branch_id, user):
                                 f"{block_reason} "
                                 "Sale blocked by compliance policy (block_sales_if_eis_down)."
                             ),
+                            'mra_submission': {
+                                'state': mra_result.get('submission_state') or 'unknown',
+                                'message': mra_result.get('submission_message') or block_reason,
+                                'retryable': bool(mra_result.get('retryable')),
+                                'queued_offline': bool(mra_result.get('queued_offline')),
+                                'endpoint': mra_result.get('endpoint'),
+                                'dry_run': bool(mra_result.get('dry_run')),
+                                'errors': mra_result.get('errors') or [],
+                                'fiscal_invoice_number': mra_result.get('fiscal_invoice_number') or order.fiscal_invoice_number or '',
+                                'eis_status': mra_result.get('eis_status') or order.eis_status or '',
+                                'offline_validation_url': mra_result.get('offline_validation_url') or '',
+                                'offline_signature': mra_result.get('offline_signature') or '',
+                            },
                         }
         except Exception as mra_exc:
             print(f"[Sync Sessions] Warning: MRA preparation failed for order {order.id}: {str(mra_exc)}")
@@ -1265,30 +1634,48 @@ def handle_create_order(order_id, data, business, branch_id, user):
                 return {
                     'success': False,
                     'error': str(mra_exc),
+                    'mra_submission': {
+                        'state': 'failed_before_submission',
+                        'message': str(mra_exc),
+                        'retryable': False,
+                    },
                 }
 
-            if _should_block_sales_if_eis_down(business_settings):
+            if eis_enabled:
                 print(
                     f"[Sync Sessions] ✗ BLOCKED order {order_id}: "
-                    "MRA submission unavailable and block_sales_if_eis_down is enabled."
+                    "MRA sale preparation failed before a valid submission result was produced."
                 )
                 order.delete()
                 return {
                     'success': False,
-                    'error': (
-                        "MRA EIS unavailable. Sale blocked by compliance policy "
-                        f"(block_sales_if_eis_down). Details: {str(mra_exc)}"
-                    ),
+                    'error': f'MRA EIS sale preparation failed. Sale was not completed. Details: {str(mra_exc)}',
+                    'mra_submission': {
+                        'state': 'failed_before_submission',
+                        'message': str(mra_exc),
+                        'retryable': False,
+                    },
                 }
 
         # Decrement inventory stock for all items in the order using FIFO
         print(f"[Sync Sessions] Decrementing inventory stock for order {order_id}")
         try:
             decrement_inventory_for_order(order, branch, business)
+        except InsufficientStockError as stock_exc:
+            print(f"[Sync Sessions] ✗ BLOCKED order {order_id}: {stock_exc}")
+            order.delete()
+            return {
+                'success': False,
+                'error': str(stock_exc),
+                'reason': 'insufficient_stock',
+            }
         except Exception as e:
-            print(f"[Sync Sessions] Warning: Failed to decrement inventory: {str(e)}")
-            # Don't fail the order creation if inventory decrement fails
-            # The frontend already decremented it locally
+            print(f"[Sync Sessions] ✗ BLOCKED order {order_id}: failed to decrement inventory: {str(e)}")
+            order.delete()
+            return {
+                'success': False,
+                'error': f'Stock update failed. Sale was not completed. Details: {str(e)}',
+            }
         
         print(f"[Sync Sessions] Created order {order_id}")
         
@@ -1313,7 +1700,7 @@ def handle_create_order(order_id, data, business, branch_id, user):
         }
 
 
-def handle_update_order(order_id, data, business, branch_id, user):
+def handle_update_order(order_id, data, business, branch_id, user, *, request_device_serial=''):
     """Handle update of order from frontend"""
     try:
         order = Order.objects.get(id=order_id, business=business, branch_id=branch_id)
@@ -1347,6 +1734,19 @@ def handle_update_order(order_id, data, business, branch_id, user):
             order.buyer_name = data.get('buyer_name') or data.get('buyerName')
         if 'buyerTin' in data or 'buyer_tin' in data:
             order.buyer_tin = data.get('buyer_tin') or data.get('buyerTin')
+        if 'buyerAuthorizationCode' in data or 'buyer_authorization_code' in data:
+            order.buyer_authorization_code = data.get('buyer_authorization_code') or data.get('buyerAuthorizationCode')
+        if 'isExport' in data or 'is_export' in data:
+            order.is_export = _parse_bool(data.get('is_export', data.get('isExport')), False)
+        if 'isReliefSupply' in data or 'is_relief_supply' in data:
+            order.is_relief_supply = _parse_bool(data.get('is_relief_supply', data.get('isReliefSupply')), False)
+        if 'vat5ProjectNumber' in data or 'vat5_project_number' in data:
+            order.vat5_project_number = data.get('vat5_project_number') or data.get('vat5ProjectNumber')
+        if 'vat5CertificateNumber' in data or 'vat5_certificate_number' in data:
+            order.vat5_certificate_number = data.get('vat5_certificate_number') or data.get('vat5CertificateNumber')
+        if 'vat5Quantity' in data or 'vat5_quantity' in data:
+            vat5_quantity = data.get('vat5_quantity', data.get('vat5Quantity'))
+            order.vat5_quantity = _to_decimal(vat5_quantity, Decimal('0')) if vat5_quantity not in (None, '') else None
         
         # Handle tax fields if provided
         if 'tax_rate_name' in data:
@@ -1398,7 +1798,14 @@ def handle_update_order(order_id, data, business, branch_id, user):
         
     except Order.DoesNotExist:
         print(f"[Sync Sessions] Order {order_id} not found, creating instead")
-        return handle_create_order(order_id, data, business, branch_id, user)
+        return handle_create_order(
+            order_id,
+            data,
+            business,
+            branch_id,
+            user,
+            request_device_serial=request_device_serial,
+        )
     except Exception as e:
         print(f"[Sync Sessions] Error updating order: {str(e)}")
         return {
@@ -1433,7 +1840,7 @@ def handle_delete_order(order_id, business, branch_id):
         }
 
 
-def decrement_inventory_for_order(order, branch, business):
+def decrement_inventory_for_order(order, branch, business, *, validate_only=False):
     """
     Decrement inventory stock for all items in an order using FIFO method.
     This ensures backend stock is synchronized with frontend stock decrements.
@@ -1583,8 +1990,7 @@ def decrement_inventory_for_order(order, branch, business):
 
         sold_inventory_item = resolve_inventory_item(sold_item_id, order_item.name)
         if not sold_inventory_item:
-            print(f"[Sync Sessions] Warning: Sold inventory item {sold_item_id} not found in branch {branch.id}")
-            continue
+            raise ValueError(f'Inventory item not found for sale line "{order_item.name or sold_item_id}".')
 
         resolved_sold_item_id = str(sold_inventory_item.id)
         if resolved_sold_item_id != sold_item_id:
@@ -1640,6 +2046,46 @@ def decrement_inventory_for_order(order, branch, business):
                 context='direct',
             )
             print(f"[Sync Sessions] Direct stock target {sold_item_id}: +{sold_quantity}")
+
+    for target_item_id, quantity_to_decrement in decrement_targets.items():
+        if quantity_to_decrement <= 0:
+            continue
+
+        inventory_item = resolve_inventory_item(target_item_id)
+        if not inventory_item:
+            raise ValueError(f'Inventory item not found for stock target {target_item_id}.')
+
+        item_id = str(inventory_item.id)
+        available_batch_total = (
+            PurchaseOrderItem.objects.filter(
+                inventory_item_id=item_id,
+                purchase_order__branch=branch,
+                quantity_remaining__gt=0,
+            )
+            .aggregate(total=Sum('quantity_remaining'))
+            .get('total')
+        )
+        if available_batch_total is not None:
+            available_quantity = parse_non_negative_decimal(
+                available_batch_total,
+                f"inventory.available_batch_total:{item_id}",
+            )
+        else:
+            available_quantity = parse_non_negative_decimal(
+                inventory_item.stock_units,
+                f"inventory.stock_units:{item_id}",
+            )
+
+        if available_quantity < quantity_to_decrement:
+            raise InsufficientStockError(
+                inventory_item.name,
+                quantity_to_decrement,
+                available_quantity,
+            )
+
+    if validate_only:
+        print(f"[Sync Sessions] Stock validation passed for order {order.id}")
+        return
 
     for target_item_id, quantity_to_decrement in decrement_targets.items():
         if quantity_to_decrement <= 0:
@@ -1773,10 +2219,11 @@ def decrement_inventory_for_order(order, branch, business):
                             'unassigned': True,
                         })
 
-            if remaining_to_decrement > 0:
-                print(
-                    f"[Sync Sessions] Warning: Could not fully decrement item {item_id}. "
-                    f"Remaining: {remaining_to_decrement}"
+            if batches and remaining_to_decrement > 0:
+                raise InsufficientStockError(
+                    inventory_item.name,
+                    quantity_to_decrement,
+                    quantity_to_decrement - remaining_to_decrement,
                 )
 
             old_stock = parse_non_negative_decimal(inventory_item.stock_units, f"inventory.stock_units:{item_id}")
@@ -1811,13 +2258,12 @@ def decrement_inventory_for_order(order, branch, business):
                 )
 
         except InventoryItem.DoesNotExist:
-            print(f"[Sync Sessions] Warning: Inventory item {target_item_id} not found in branch {branch.id}")
-            continue
+            raise ValueError(f'Inventory item {target_item_id} not found in branch {branch.id}.')
         except Exception as e:
             print(f"[Sync Sessions] Error decrementing inventory for item {target_item_id}: {str(e)}")
             import traceback
             traceback.print_exc()
-            continue
+            raise
 
     for order_item in order_items:
         normalized_trace = normalize_trace_entries(per_order_item_usage.get(order_item.id, []))

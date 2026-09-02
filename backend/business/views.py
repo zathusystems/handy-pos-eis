@@ -222,9 +222,31 @@ class BusinessViewSet(viewsets.ModelViewSet):
     def branches(self, request, pk=None):
         """Get all branches for business"""
         business = self.get_object()
-        branches = business.branches.all()
+        branches = business.branches.filter(is_active=True)
         serializer = BranchSerializer(branches, many=True)
         return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def sync_eis_branches(self, request, pk=None):
+        """Mirror MRA EIS sites into local branches for this business."""
+        business = self.get_object()
+        try:
+            from mra_eis.services import EISBranchSyncService
+
+            result = EISBranchSyncService.sync_for_business(business)
+            branches = business.branches.filter(is_active=True)
+            return Response(
+                {
+                    **result,
+                    'branches': BranchSerializer(branches, many=True).data,
+                },
+                status=status.HTTP_200_OK,
+            )
+        except Exception as exc:
+            return Response(
+                {'error': str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
     @action(detail=True, methods=['post'])
     def add_tax_rate(self, request, pk=None):
@@ -321,6 +343,15 @@ class TaxRateViewSet(viewsets.ModelViewSet):
     ordering_fields = ['name', 'rate', 'is_default', 'created_at']
     ordering = ['-is_default', '-created_at']
 
+    def _is_business_eis_enabled(self, business: Business) -> bool:
+        return bool(getattr(getattr(business, 'settings', None), 'enable_eis', False))
+
+    def _ensure_local_tax_management_allowed(self, business: Business) -> None:
+        if self._is_business_eis_enabled(business):
+            raise serializers.ValidationError({
+                'error': 'Local tax management is disabled because MRA EIS is enabled. Use MRA product tax mappings.'
+            })
+
     def get_queryset(self):
         """Filter tax rates by business owner"""
         return TaxRate.objects.filter(business__owner=self.request.user)
@@ -338,6 +369,7 @@ class TaxRateViewSet(viewsets.ModelViewSet):
         business = self.request.user.businesses.first()
         if not business:
             raise serializers.ValidationError('User must have a business')
+        self._ensure_local_tax_management_allowed(business)
         serializer.save(business=business, created_by=self.request.user)
 
     def _ensure_tax_rate_mutable(self, tax_rate: TaxRate) -> None:
@@ -349,11 +381,13 @@ class TaxRateViewSet(viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         """Update tax rate with immutability check"""
+        self._ensure_local_tax_management_allowed(serializer.instance.business)
         self._ensure_tax_rate_mutable(serializer.instance)
         serializer.save()
 
     def perform_destroy(self, instance):
         """Delete tax rate with immutability check"""
+        self._ensure_local_tax_management_allowed(instance.business)
         self._ensure_tax_rate_mutable(instance)
         super().perform_destroy(instance)
 
@@ -361,6 +395,7 @@ class TaxRateViewSet(viewsets.ModelViewSet):
     def set_default(self, request, pk=None):
         """Set this tax rate as default for business"""
         tax_rate = self.get_object()
+        self._ensure_local_tax_management_allowed(tax_rate.business)
 
         # Unset all other defaults for this business
         TaxRate.objects.filter(business=tax_rate.business).update(is_default=False)

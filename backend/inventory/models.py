@@ -31,10 +31,12 @@ class Supplier(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     business = models.ForeignKey(Business, on_delete=models.CASCADE, related_name='suppliers')
     name = models.CharField(max_length=255)
+    contact_person = models.CharField(max_length=255, blank=True)
     email = models.EmailField(blank=True)
     phone = models.CharField(max_length=32, blank=True)
     address = models.TextField(blank=True)
     city = models.CharField(max_length=100, blank=True)
+    region = models.CharField(max_length=100, blank=True)
     country = models.CharField(max_length=100, blank=True)
     is_active = models.BooleanField(default=True)
     
@@ -44,6 +46,11 @@ class Supplier(models.Model):
         blank=True,
         null=True,
         help_text="Supplier's Tax Identification Number (for VAT reclaim)"
+    )
+    mra_supplier_id = models.PositiveIntegerField(
+        blank=True,
+        null=True,
+        help_text="Supplier ID assigned by MRA EIS, required for goods receiving when available"
     )
     vat_registered = models.BooleanField(
         default=False,
@@ -70,6 +77,7 @@ class Supplier(models.Model):
         indexes = [
             models.Index(fields=['business', 'is_active']),
             models.Index(fields=['supplier_tin']),
+            models.Index(fields=['mra_supplier_id'], name='inventory_s_mra_sup_fa42c2_idx'),
             models.Index(fields=['is_dirty']),
         ]
 
@@ -195,7 +203,15 @@ class MRAProductMapping(models.Model):
         default='inclusive',
         help_text="How is tax calculated for this product? (Immutable once approved)"
     )
-    
+    mra_levies = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="MRA levy metadata for this product, normalized as levyTypeId/levyRate rows"
+    )
+    is_product = models.BooleanField(
+        default=True,
+        help_text="True for physical products; false for MRA service items that do not carry stock."
+    )
     # Approval Status
     is_approved = models.BooleanField(
         default=False,
@@ -234,6 +250,35 @@ class MRAProductMapping(models.Model):
         display_name = self.mra_product_name or 'Unassigned MRA Product'
         display_code = self.mra_product_code or 'No Code'
         return f"{display_name} ({display_code})"
+
+    def uses_standard_vat(self):
+        """Return True when the MRA mapping is standard VAT with a positive rate."""
+        try:
+            tax_rate = Decimal(str(self.mra_tax_rate or 0))
+        except Exception:
+            tax_rate = Decimal('0')
+        tax_type = str(self.mra_tax_type or '').strip().lower()
+        return tax_type not in {
+            'zero',
+            'zero_rated',
+            'zero-rated',
+            'vat_zero',
+            'exempt',
+            'vat_exempt',
+        } and tax_rate > 0
+
+    def is_taxpayer_compatible(self):
+        """Return True for MRA-approved product tax metadata.
+
+        MRA confirmed non-VAT taxpayers can still submit EIS sales. The POS must
+        preserve the tax metadata returned by MRA terminal-site products instead
+        of blocking locally based on taxpayer VAT status.
+        """
+        return True
+
+    def taxpayer_compatibility_error(self):
+        """Compatibility warning placeholder retained for API stability."""
+        return ''
 
     def is_ready_for_sale(self):
         """Check if product is ready to be sold"""
@@ -283,6 +328,7 @@ class InventoryItem(models.Model):
     value = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     is_variable_price = models.BooleanField(default=False)
     is_fuel = models.BooleanField(default=False)
+    is_oil = models.BooleanField(default=False)
     
     # MRA Price Control (NEW)
     price_locked = models.BooleanField(
@@ -413,6 +459,13 @@ class InventoryItem(models.Model):
 
 class PurchaseOrder(models.Model):
     """Purchase order with MRA compliance tracking"""
+    EIS_STOCK_RECEIPT_SOURCE_POS = 'pos_goods_receiving'
+    EIS_STOCK_RECEIPT_SOURCE_SUPPLIER = 'supplier_sale'
+    EIS_STOCK_RECEIPT_SOURCE_CHOICES = [
+        (EIS_STOCK_RECEIPT_SOURCE_POS, 'POS submits informal/manual purchase to EIS'),
+        (EIS_STOCK_RECEIPT_SOURCE_SUPPLIER, 'B2B stock transfer already posted in EIS'),
+    ]
+
     STATUS_CHOICES = [
         ('Draft', 'Draft'),
         ('Pending', 'Pending Approval'),
@@ -466,9 +519,20 @@ class PurchaseOrder(models.Model):
         null=True,
         help_text="Supplier TIN for VAT reclaim"
     )
+    mra_supplier_id = models.PositiveIntegerField(
+        blank=True,
+        null=True,
+        help_text="Supplier ID assigned by MRA EIS at the time stock was received"
+    )
     supplier_vat_registered = models.BooleanField(
         default=False,
         help_text="Is supplier VAT registered?"
+    )
+    eis_stock_receipt_source = models.CharField(
+        max_length=32,
+        choices=EIS_STOCK_RECEIPT_SOURCE_CHOICES,
+        default=EIS_STOCK_RECEIPT_SOURCE_POS,
+        help_text="Controls whether POS submits receive-stock to EIS or records only local batch details because a B2B EIS stock transfer already updated MRA stock.",
     )
     
     # Notes
@@ -493,6 +557,7 @@ class PurchaseOrder(models.Model):
             models.Index(fields=['supplier']),
             models.Index(fields=['status']),
             models.Index(fields=['supplier_tin']),
+            models.Index(fields=['mra_supplier_id'], name='inventory_p_mra_sup_3d9da3_idx'),
             models.Index(fields=['is_dirty']),
         ]
 

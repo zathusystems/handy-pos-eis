@@ -16,6 +16,41 @@ from .models import (
 )
 
 
+def _is_non_vat_business(business) -> bool:
+    try:
+        from mra_eis.services import ConfigurationService
+
+        return ConfigurationService.is_taxpayer_explicitly_non_vat(business)
+    except Exception:
+        taxpayer_type = str(getattr(business, 'mra_taxpayer_type', '') or '').strip().upper().replace('-', '_')
+        return taxpayer_type in {'NON_VAT', 'NONVAT', 'NON_VAT_REGISTERED'}
+
+
+def _mapping_uses_standard_vat(tax_type, tax_rate) -> bool:
+    category = str(tax_type or '').strip().lower()
+    try:
+        rate = Decimal(str(tax_rate or 0))
+    except Exception:
+        rate = Decimal('0')
+    return category not in {'zero', 'zero_rated', 'zero-rated', 'vat_zero', 'exempt', 'vat_exempt'} and rate > 0
+
+
+def _validate_mapping_tax_for_inventory_item(attrs, inventory_item, instance=None):
+    tax_type = attrs.get('mra_tax_type', getattr(instance, 'mra_tax_type', None))
+    tax_rate = attrs.get('mra_tax_rate', getattr(instance, 'mra_tax_rate', None))
+    tax_method = attrs.get('tax_calculation_method', getattr(instance, 'tax_calculation_method', 'inclusive'))
+
+    if tax_type in {'zero', 'exempt'}:
+        attrs['mra_tax_rate'] = Decimal('0.00')
+        attrs['tax_calculation_method'] = 'inclusive'
+        return attrs
+
+    # MRA confirmed non-VAT taxpayers can still submit EIS sales. Preserve the
+    # MRA-approved product tax metadata instead of blocking standard VAT locally.
+    attrs['tax_calculation_method'] = tax_method
+    return attrs
+
+
 # ============================================================================
 # SUPPLIER SERIALIZERS
 # ============================================================================
@@ -27,9 +62,10 @@ class SupplierSerializer(serializers.ModelSerializer):
     class Meta:
         model = Supplier
         fields = [
-            'id', 'name', 'email', 'phone', 'address', 'city', 'country',
+            'id', 'name', 'contact_person', 'email', 'phone', 'address',
+            'city', 'region', 'country',
             'is_active', 'total_amount_due', 'total_amount_paid', 'balance_due',
-            'supplier_tin', 'vat_registered',
+            'supplier_tin', 'mra_supplier_id', 'vat_registered',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
@@ -48,8 +84,9 @@ class SupplierCreateUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Supplier
         fields = [
-            'name', 'email', 'phone', 'address', 'city', 'country',
-            'is_active', 'supplier_tin', 'vat_registered'
+            'name', 'contact_person', 'email', 'phone', 'address',
+            'city', 'region', 'country',
+            'is_active', 'supplier_tin', 'mra_supplier_id', 'vat_registered'
         ]
 
 
@@ -64,6 +101,9 @@ class MRAProductMappingSerializer(serializers.ModelSerializer):
         read_only=True
     )
     branch_name = serializers.SerializerMethodField()
+    is_ready_for_sale = serializers.SerializerMethodField()
+    is_taxpayer_compatible = serializers.SerializerMethodField()
+    taxpayer_compatibility_error = serializers.SerializerMethodField()
     
     class Meta:
         model = MRAProductMapping
@@ -71,7 +111,10 @@ class MRAProductMappingSerializer(serializers.ModelSerializer):
             'id', 'inventory_item', 'inventory_item_name', 'branch', 'branch_name',
             'mra_product_code', 'mra_product_name', 'mra_tax_type',
             'mra_tax_rate', 'mra_unit_measure', 'tax_calculation_method',
-            'is_approved', 'approved_at', 'mra_synced', 'last_synced_at', 'created_at'
+            'mra_levies', 'is_product',
+            'is_approved', 'approved_at', 'mra_synced', 'last_synced_at',
+            'is_ready_for_sale', 'is_taxpayer_compatible',
+            'taxpayer_compatibility_error', 'created_at'
         ]
         read_only_fields = [
             'id', 'branch', 'approved_at', 'last_synced_at', 'created_at'
@@ -81,6 +124,19 @@ class MRAProductMappingSerializer(serializers.ModelSerializer):
         """Safely derive branch name even when mapping has no branch."""
         branch = getattr(obj, 'branch', None)
         return branch.name if branch else None
+
+    def get_is_ready_for_sale(self, obj):
+        return bool(obj.is_ready_for_sale())
+
+    def get_is_taxpayer_compatible(self, obj):
+        return bool(obj.is_taxpayer_compatible())
+
+    def get_taxpayer_compatibility_error(self, obj):
+        return obj.taxpayer_compatibility_error()
+
+    def validate(self, attrs):
+        inventory_item = attrs.get('inventory_item') or getattr(self.instance, 'inventory_item', None)
+        return _validate_mapping_tax_for_inventory_item(attrs, inventory_item, self.instance)
 
 
 class MRAProductMappingCreateSerializer(serializers.Serializer):
@@ -116,6 +172,8 @@ class MRAProductMappingCreateSerializer(serializers.Serializer):
         required=False,
         default='inclusive'
     )
+    mra_levies = serializers.JSONField(required=False, default=list)
+    is_product = serializers.BooleanField(required=False, default=True)
 
     def validate_mra_tax_rate(self, value):
         """Validate tax rate is between 0 and 100"""
@@ -128,7 +186,7 @@ class MRAProductMappingCreateSerializer(serializers.Serializer):
     def validate_inventory_item_id(self, value):
         """Validate inventory item exists"""
         try:
-            InventoryItem.objects.get(id=value)
+            self._inventory_item = InventoryItem.objects.select_related('business').get(id=value)
         except InventoryItem.DoesNotExist:
             raise serializers.ValidationError(
                 f"Inventory item with ID {value} does not exist"
@@ -146,7 +204,12 @@ class MRAProductMappingCreateSerializer(serializers.Serializer):
         if tax_type in {'zero', 'exempt'}:
             attrs['mra_tax_rate'] = Decimal('0.00')
             attrs['tax_calculation_method'] = 'inclusive'
+            attrs['mra_levies'] = attrs.get('mra_levies') or []
             return attrs
+
+        inventory_item = getattr(self, '_inventory_item', None)
+        _validate_mapping_tax_for_inventory_item(attrs, inventory_item)
+        attrs['mra_levies'] = attrs.get('mra_levies') or []
 
         # Standard-rated products must carry a positive tax rate.
         if tax_rate is None or tax_rate <= 0:
@@ -194,7 +257,7 @@ class InventoryItemSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'category', 'item_type', 'stock_units',
             'unit_type', 'reorder_level', 'status', 'cost', 'price',
-            'value', 'is_variable_price', 'is_fuel', 'sku', 'barcode', 'product_code',
+            'value', 'is_variable_price', 'is_fuel', 'is_oil', 'sku', 'barcode', 'product_code',
             'expiry', 'on_menu', 'supplier', 'manufacturer', 'batch',
             'brand', 'is_recipe_ingredient', 'is_produced',
             'is_sold_in_portions', 'portion_name', 'portions_per_unit',
@@ -225,7 +288,7 @@ class InventoryItemCreateUpdateSerializer(serializers.ModelSerializer):
         model = InventoryItem
         fields = [
             'name', 'category', 'item_type', 'stock_units', 'unit_type',
-            'reorder_level', 'cost', 'price', 'is_variable_price', 'is_fuel',
+            'reorder_level', 'cost', 'price', 'is_variable_price', 'is_fuel', 'is_oil',
             'sku', 'barcode', 'product_code', 'expiry', 'on_menu', 'supplier',
             'manufacturer', 'batch', 'brand', 'is_recipe_ingredient',
             'is_produced', 'is_sold_in_portions', 'portion_name',
@@ -331,7 +394,8 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'order_number', 'supplier', 'supplier_name', 'status',
             'total_items', 'total_cost', 'payment_status', 'amount_paid',
-            'amount_due', 'reference_number', 'vat_amount', 'items', 'created_at', 'updated_at'
+            'amount_due', 'reference_number', 'vat_amount', 'received_date',
+            'mra_supplier_id', 'eis_stock_receipt_source', 'items', 'created_at', 'updated_at'
         ]
         read_only_fields = [
             'id', 'order_number', 'total_items', 'total_cost',
@@ -344,7 +408,7 @@ class PurchaseOrderDetailSerializer(PurchaseOrderSerializer):
     class Meta(PurchaseOrderSerializer.Meta):
         fields = PurchaseOrderSerializer.Meta.fields + [
             'supplier_tin', 'supplier_vat_registered', 'notes',
-            'created_by', 'received_date'
+            'created_by'
         ]
 
 
@@ -355,8 +419,8 @@ class PurchaseOrderCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = PurchaseOrder
         fields = [
-            'supplier', 'notes', 'supplier_tin', 'supplier_vat_registered',
-            'reference_number', 'vat_amount'
+            'supplier', 'notes', 'supplier_tin', 'mra_supplier_id', 'supplier_vat_registered',
+            'eis_stock_receipt_source', 'reference_number', 'vat_amount', 'received_date'
         ]
 
 

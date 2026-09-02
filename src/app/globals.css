@@ -4,22 +4,33 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ✅ Desktop-safe base styles for Tauri */
-html, body {
+/* Keep browser and older Android WebView pages scrollable. Individual app
+   shells provide their own bounded scroll areas where appropriate. */
+html,
+body {
   width: 100%;
-  height: 100%;
+  min-height: 100%;
   margin: 0;
   padding: 0;
-  overflow: hidden;
+  overflow-x: hidden;
 }
 
 :root {
   --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   --font-mono: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+  --tauri-android-viewport-height: 100vh;
+}
+
+@supports (height: 100dvh) {
+  :root {
+    --tauri-android-viewport-height: 100dvh;
+  }
 }
 
 body {
   font-family: var(--font-sans);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -54,7 +65,7 @@ html[data-tauri-android='true'] .tauri-android-toast-viewport {
   --tauri-android-top-inset: max(env(safe-area-inset-top, 0px), 24px);
   top: 0 !important;
   padding-top: calc(0.75rem + var(--tauri-android-top-inset)) !important;
-  max-height: calc(100dvh - var(--tauri-android-top-inset)) !important;
+  max-height: calc(var(--tauri-android-viewport-height) - var(--tauri-android-top-inset)) !important;
 }
 
 /* Keep fixed buttons and modal actions above Android gesture/navigation bars. */
@@ -71,15 +82,15 @@ html[data-tauri-android='true'] .tauri-android-floating-bottom {
 html[data-tauri-android='true'] .tauri-android-dialog-content {
   --tauri-android-top-inset: max(env(safe-area-inset-top, 0px), 24px);
   --tauri-android-bottom-inset: max(env(safe-area-inset-bottom, 0px), 24px);
-  top: calc(var(--tauri-android-top-inset) + ((100dvh - var(--tauri-android-top-inset) - var(--tauri-android-bottom-inset)) / 2)) !important;
-  max-height: calc(100dvh - var(--tauri-android-top-inset) - var(--tauri-android-bottom-inset) - 1rem) !important;
+  top: calc(var(--tauri-android-top-inset) + ((var(--tauri-android-viewport-height) - var(--tauri-android-top-inset) - var(--tauri-android-bottom-inset)) / 2)) !important;
+  max-height: calc(var(--tauri-android-viewport-height) - var(--tauri-android-top-inset) - var(--tauri-android-bottom-inset) - 1rem) !important;
   padding-bottom: max(1rem, env(safe-area-inset-bottom, 0px)) !important;
 }
 
 html[data-tauri-android='true'] .tauri-android-sheet-content {
   --tauri-android-top-inset: max(env(safe-area-inset-top, 0px), 24px);
   --tauri-android-bottom-inset: max(env(safe-area-inset-bottom, 0px), 24px);
-  max-height: calc(100dvh - var(--tauri-android-top-inset) - var(--tauri-android-bottom-inset)) !important;
+  max-height: calc(var(--tauri-android-viewport-height) - var(--tauri-android-top-inset) - var(--tauri-android-bottom-inset)) !important;
 }
 
 html[data-tauri-android='true'] .tauri-android-sheet-content[data-state] {

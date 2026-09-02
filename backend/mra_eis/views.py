@@ -1,6 +1,8 @@
 """
 MRA EIS API Views - REST endpoints for MRA integration
 """
+import re
+
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -9,22 +11,24 @@ from django.conf import settings
 from django.shortcuts import get_object_or_404
 from django.db.models import Q
 from .models import (
-    Terminal, TerminalActivationCode, MRAConfiguration, MRAProductMapping,
+    Terminal, TerminalActivationCode, MRAConfiguration,
     MRAInvoice, OfflineInvoiceQueue, Receipt, InvoiceAuditLog,
     TerminalAuditLog, MRAAPIError
 )
 from .serializers import (
     TerminalSerializer, TerminalDetailSerializer, TerminalActivationSerializer,
-    MRAConfigurationSerializer, MRAProductMappingSerializer,
-    MRAProductMappingCreateSerializer, MRAInvoiceSerializer,
+    MRAConfigurationSerializer, MRAInvoiceSerializer,
     MRAInvoiceCreateSerializer, OfflineInvoiceQueueSerializer,
     ReceiptSerializer, InvoiceAuditLogSerializer, TerminalAuditLogSerializer,
     MRAAPIErrorSerializer, TerminalStatusSerializer, SyncStatusSerializer
 )
 from .services import (
     TerminalService, ConfigurationService, ProductMappingService,
-    InvoiceService, ReceiptService, RetryService, POSOrderSubmissionService
+    InvoiceService, ReceiptService, RetryService, POSOrderSubmissionService,
+    EISSaleComplianceService, MRAIntegrationError, ReceiptLookupService,
+    TransactionReconciliationService
 )
+from .services.core import _is_mra_network_failure
 from rest_framework.views import APIView
 
 
@@ -78,6 +82,29 @@ def _normalize_mra_tax_rate(value, tax_type):
         return 0.0 if tax_type in {'zero', 'exempt'} else 16.5
 
 
+def _parse_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {'1', 'true', 'yes', 'y', 'on'}:
+        return True
+    if normalized in {'0', 'false', 'no', 'n', 'off'}:
+        return False
+    return default
+
+
+def _normalize_branch_lookup(value):
+    raw = str(value or '').strip()
+    if not raw:
+        return raw
+    legacy_match = re.match(r'^(?:BRN|branch)-(\d+)$', raw, flags=re.IGNORECASE)
+    if legacy_match:
+        return legacy_match.group(1)
+    return raw
+
+
 def _normalize_product_code_item(item):
     if not isinstance(item, dict):
         return None
@@ -87,6 +114,8 @@ def _normalize_product_code_item(item):
         or item.get('mra_product_code')
         or item.get('product_code')
         or item.get('productCode')
+        or item.get('productId')
+        or item.get('productID')
         or item.get('item_code')
         or item.get('itemCode')
         or item.get('hs_code')
@@ -241,6 +270,11 @@ class TerminalViewSet(viewsets.ModelViewSet):
                 {'error': str(e)},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        except MRAIntegrationError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_502_BAD_GATEWAY
+            )
 
     @action(detail=True, methods=['post'])
     def refresh_token(self, request, pk=None):
@@ -258,10 +292,27 @@ class TerminalViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+    @action(detail=True, methods=['post'])
+    def reset_activation(self, request, pk=None):
+        """Remove a local failed terminal activation so onboarding can be retried."""
+        terminal = self.get_object()
+        try:
+            result = TerminalService.reset_failed_activation(terminal)
+            return Response(result, status=status.HTTP_200_OK)
+        except ValueError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
     @action(detail=True, methods=['get'])
     def status(self, request, pk=None):
-        """Get terminal status"""
+        """Get terminal status, using MRA utilities ping for online state."""
         terminal = self.get_object()
+        should_ping = _parse_bool(request.query_params.get('ping'), True)
+        health_check = TerminalService.check_terminal_health(terminal) if should_ping else None
+        if health_check is not None:
+            terminal.refresh_from_db()
 
         pending_offline = OfflineInvoiceQueue.objects.filter(
             terminal=terminal,
@@ -269,17 +320,44 @@ class TerminalViewSet(viewsets.ModelViewSet):
         ).count()
 
         serializer = TerminalStatusSerializer({
+            'id': str(terminal.id),
+            'business': str(terminal.business_id),
+            'branch': str(terminal.branch_id),
             'terminal_id': terminal.terminal_id,
+            'mra_terminal_id': terminal.mra_terminal_id,
+            'device_serial': terminal.device_serial,
+            'mac_address': terminal.mac_address,
+            'pos_name': terminal.pos_name,
+            'pos_version': terminal.pos_version,
+            'os_type': terminal.os_type,
             'status': terminal.status,
             'is_online': terminal.is_online,
+            'has_mra_token': bool(terminal.mra_token),
             'online_invoice_counter': terminal.online_invoice_counter,
             'offline_invoice_counter': terminal.offline_invoice_counter,
             'pending_offline_invoices': pending_offline,
+            'activated_at': terminal.activated_at,
             'token_expires_at': terminal.token_expires_at,
             'last_sync_at': terminal.last_sync_at,
+            'blocking_status': TerminalService.get_cached_blocking_status(terminal),
+            'health_check': health_check,
         })
 
         return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def health_check(self, request, pk=None):
+        """Run the official MRA utilities ping for this terminal."""
+        terminal = self.get_object()
+        health_check = TerminalService.check_terminal_health(terminal)
+        terminal.refresh_from_db()
+        return Response(
+            {
+                **health_check,
+                'terminal': TerminalDetailSerializer(terminal).data,
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=['post'])
     def update_online_status(self, request, pk=None):
@@ -294,6 +372,75 @@ class TerminalViewSet(viewsets.ModelViewSet):
             status=status.HTTP_200_OK
         )
 
+    @action(detail=True, methods=['post'])
+    def check_blocking_status(self, request, pk=None):
+        """Fetch MRA terminal block message and unblock status."""
+        terminal = self.get_object()
+        try:
+            result = TerminalService.sync_terminal_blocking_status(terminal)
+            result['terminal'] = TerminalDetailSerializer(terminal).data
+            return Response(result, status=status.HTTP_200_OK)
+        except MRAIntegrationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'])
+    def reconcile_last_transactions(self, request, pk=None):
+        """Reconcile local sale state with MRA's last online/offline transactions."""
+        terminal = self.get_object()
+        modes = request.data.get('modes') or request.data.get('mode') or ['online', 'offline']
+        if isinstance(modes, str):
+            modes = [modes]
+
+        result = TransactionReconciliationService.reconcile_terminal(terminal, modes=modes)
+        return Response(result, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'])
+    def lookup_invoice(self, request, pk=None):
+        """Look up a submitted MRA receipt by fiscal invoice number."""
+        terminal = self.get_object()
+        invoice_number = (
+            request.data.get('invoiceNumber')
+            or request.data.get('invoice_number')
+            or request.data.get('receiptNumber')
+            or request.data.get('receipt_number')
+            or ''
+        )
+        try:
+            result = ReceiptLookupService.lookup_invoice_by_number(terminal, invoice_number)
+            return Response(result, status=status.HTTP_200_OK)
+        except MRAIntegrationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    @action(detail=True, methods=['post'])
+    def get_void_receipts(self, request, pk=None):
+        """Fetch MRA cancelled/void receipt requests for certification evidence."""
+        terminal = self.get_object()
+        try:
+            result = ReceiptLookupService.get_void_receipts(
+                terminal,
+                invoice_number=(
+                    request.data.get('invoiceNumber')
+                    or request.data.get('invoice_number')
+                    or request.data.get('receiptNumber')
+                    or request.data.get('receipt_number')
+                    or ''
+                ),
+                status_value=request.data.get('status'),
+                start_date=request.data.get('startDate') or request.data.get('start_date') or '',
+                end_date=request.data.get('endDate') or request.data.get('end_date') or '',
+                page=request.data.get('page') or 1,
+                page_size=request.data.get('pageSize') or request.data.get('page_size') or 25,
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except MRAIntegrationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+
     @action(detail=True, methods=['get'])
     def audit_logs(self, request, pk=None):
         """Get terminal audit logs"""
@@ -302,6 +449,239 @@ class TerminalViewSet(viewsets.ModelViewSet):
 
         serializer = TerminalAuditLogSerializer(logs, many=True)
         return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def submit_initial_inventory(self, request, pk=None):
+        """Submit taxpayer initial inventory products to MRA EIS."""
+        terminal = self.get_object()
+        tin = request.data.get('TIN') or request.data.get('tin') or terminal.business.tin or ''
+        products = request.data.get('Products') or request.data.get('products') or []
+        is_last_batch = request.data.get(
+            'isLastBatch',
+            request.data.get('IsLastBatch', request.data.get('is_last_batch', False)),
+        )
+
+        try:
+            result = ProductMappingService.submit_initial_inventory(
+                business=terminal.business,
+                terminal=terminal,
+                tin=tin,
+                products=products,
+                is_last_batch=_parse_bool(is_last_batch),
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    @action(detail=True, methods=['post'])
+    def import_initial_inventory(self, request, pk=None):
+        """Import MRA uploaded initial inventory into POS inventory and mappings."""
+        terminal = self.get_object()
+        data = request.data
+        if isinstance(data, list):
+            products = data
+            mark_as_mra_synced = False
+        else:
+            products = data.get('Products') or data.get('products') or data.get('items') or []
+            mark_as_mra_synced = data.get(
+                'markAsMraSynced',
+                data.get('mark_as_mra_synced', data.get('mraSynced', False)),
+            )
+
+        try:
+            result = ProductMappingService.import_initial_inventory_to_pos(
+                business=terminal.business,
+                terminal=terminal,
+                products=products,
+                user=request.user,
+                mark_as_mra_synced=_parse_bool(mark_as_mra_synced),
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    @action(detail=True, methods=['post'])
+    def pull_approved_products(self, request, pk=None):
+        """Pull MRA portal-approved terminal/site products into POS inventory."""
+        terminal = self.get_object()
+        refresh_from_mra = request.data.get(
+            'refreshFromMra',
+            request.data.get('refresh_from_mra', True),
+        )
+
+        try:
+            result = ProductMappingService.pull_approved_products_to_inventory(
+                business=terminal.business,
+                terminal=terminal,
+                user=request.user,
+                refresh_from_mra=_parse_bool(refresh_from_mra),
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    @action(detail=True, methods=['post'])
+    def add_product(self, request, pk=None):
+        """Submit a new product to MRA EIS add-product endpoint."""
+        terminal = self.get_object()
+        product_payload = request.data.get('product') if isinstance(request.data, dict) else None
+        if not isinstance(product_payload, dict):
+            product_payload = request.data
+
+        try:
+            result = ProductMappingService.add_product_to_mra(
+                business=terminal.business,
+                terminal=terminal,
+                product=product_payload,
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except MRAIntegrationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    @action(detail=True, methods=['get'])
+    def hs_codes(self, request, pk=None):
+        """Fetch MRA HS codes used by the add-product endpoint."""
+        terminal = self.get_object()
+        try:
+            result = ProductMappingService.fetch_hs_codes(
+                business=terminal.business,
+                terminal=terminal,
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except MRAIntegrationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    @action(detail=True, methods=['get'])
+    def units_of_measure(self, request, pk=None):
+        """Fetch MRA units of measure used by the add-product endpoint."""
+        terminal = self.get_object()
+        try:
+            result = ProductMappingService.fetch_units_of_measure(
+                business=terminal.business,
+                terminal=terminal,
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except MRAIntegrationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    @action(detail=True, methods=['post'])
+    def reconcile_inventory(self, request, pk=None):
+        """Compare local approved POS inventory with EIS warehouse stock."""
+        terminal = self.get_object()
+        branch = terminal.branch
+        branch_id = request.data.get('branch_id') or request.data.get('branchId')
+        if branch_id:
+            from business.models import Branch
+            branch = get_object_or_404(Branch, id=branch_id, business=terminal.business)
+
+        try:
+            result = ProductMappingService.reconcile_inventory_with_eis(
+                business=terminal.business,
+                terminal=terminal,
+                branch=branch,
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    @action(detail=True, methods=['get'])
+    def warehouse_inventory(self, request, pk=None):
+        """Fetch official MRA warehouse stock for this taxpayer."""
+        terminal = self.get_object()
+        try:
+            page_size = int(request.query_params.get('page_size') or request.query_params.get('pageSize') or 200)
+        except (TypeError, ValueError):
+            page_size = 200
+        try:
+            max_pages = int(request.query_params.get('max_pages') or request.query_params.get('maxPages') or 25)
+        except (TypeError, ValueError):
+            max_pages = 25
+
+        try:
+            result = ProductMappingService.fetch_warehouse_inventory(
+                business=terminal.business,
+                terminal=terminal,
+                page_size=page_size,
+                max_pages=max_pages,
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except MRAIntegrationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    @action(detail=True, methods=['post'])
+    def transfer_inventory(self, request, pk=None):
+        """Transfer official MRA inventory between warehouse and mapped sites."""
+        terminal = self.get_object()
+        from_branch = None
+        to_branch = None
+        from_branch_id = request.data.get('fromBranchId') or request.data.get('from_branch_id')
+        to_branch_id = request.data.get('toBranchId') or request.data.get('to_branch_id') or request.data.get('branch_id')
+        if from_branch_id:
+            from business.models import Branch
+            from_branch = get_object_or_404(Branch, id=_normalize_branch_lookup(from_branch_id), business=terminal.business)
+        if to_branch_id:
+            from business.models import Branch
+            to_branch = get_object_or_404(Branch, id=_normalize_branch_lookup(to_branch_id), business=terminal.business)
+
+        try:
+            from_warehouse_to_site = _parse_bool(
+                request.data.get('fromWarehouseToSite', request.data.get('from_warehouse_to_site', True)),
+                True,
+            )
+            from_site_id = request.data.get('fromSiteId') or request.data.get('from_site_id') or ''
+            if not from_warehouse_to_site and from_branch is not None and not str(from_site_id or '').strip():
+                from_site_id = (
+                    getattr(from_branch, 'mra_site_id', '')
+                    or getattr(from_branch, 'mra_branch_code', '')
+                    or ConfigurationService.get_terminal_site_id(terminal.business, from_branch)
+                    or ''
+                )
+
+            to_site_id = request.data.get('toSiteId') or request.data.get('to_site_id') or ''
+            if to_branch is not None and not str(to_site_id or '').strip():
+                to_site_id = (
+                    getattr(to_branch, 'mra_site_id', '')
+                    or getattr(to_branch, 'mra_branch_code', '')
+                    or ConfigurationService.get_terminal_site_id(terminal.business, to_branch)
+                    or ''
+                )
+
+            result = ProductMappingService.transfer_inventory(
+                business=terminal.business,
+                terminal=terminal,
+                items=request.data.get('items') or [],
+                to_branch=to_branch,
+                to_site_id=to_site_id,
+                from_site_id=from_site_id,
+                from_warehouse_to_site=from_warehouse_to_site,
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except MRAIntegrationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
 
 
 class MRAConfigurationViewSet(viewsets.ReadOnlyModelViewSet):
@@ -330,22 +710,41 @@ class MRAConfigurationViewSet(viewsets.ReadOnlyModelViewSet):
     def sync_from_mra(self, request):
         """Fetch and sync configurations from MRA"""
         business_id = request.query_params.get('business_id')
+        terminal_id = request.query_params.get('terminal_id')
         accessible_businesses = _get_accessible_business_queryset(request.user)
         business = get_object_or_404(accessible_businesses, id=business_id)
 
         config_types = request.data.get('config_types', None)
+        terminal = None
+        if terminal_id:
+            terminal = get_object_or_404(Terminal, id=terminal_id, business=business)
+        else:
+            terminal = (
+                Terminal.objects.filter(business=business)
+                .exclude(mra_token='')
+                .order_by('-updated_at')
+                .first()
+            )
 
         try:
             sync_log = ConfigurationService.fetch_and_store_configuration(
                 business=business,
-                config_types=config_types
+                config_types=config_types,
+                terminal=terminal,
             )
+            product_sync = None
+            if request.data.get('sync_products', False):
+                product_sync = ProductMappingService.sync_terminal_site_products(
+                    business=business,
+                    terminal=terminal,
+                )
 
             return Response(
                 {
                     'status': sync_log.status,
                     'config_types': sync_log.config_types,
-                    'completed_at': sync_log.completed_at
+                    'completed_at': sync_log.completed_at,
+                    'product_sync': product_sync,
                 },
                 status=status.HTTP_200_OK
             )
@@ -355,51 +754,25 @@ class MRAConfigurationViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-
-class MRAProductMappingViewSet(viewsets.ModelViewSet):
-    """
-    ViewSet for product to MRA code mappings.
-    """
-    permission_classes = [IsAuthenticated]
-    serializer_class = MRAProductMappingSerializer
-
-    def get_queryset(self):
-        """Filter mappings by business"""
-        business_ids = _get_accessible_business_queryset(self.request.user).values_list('id', flat=True)
-        return MRAProductMapping.objects.filter(
-            business_id__in=business_ids,
-            is_active=True
-        )
-
-    def get_serializer_class(self):
-        if self.action == 'create':
-            return MRAProductMappingCreateSerializer
-        return MRAProductMappingSerializer
-
-    def create(self, request, *args, **kwargs):
-        """Create a product mapping"""
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
-        business_id = request.query_params.get('business_id')
+    @action(detail=False, methods=['post'])
+    def ensure_fresh(self, request):
+        """Refresh MRA configuration if it is missing or older than policy allows."""
+        business_id = request.query_params.get('business_id') or request.data.get('business_id')
+        terminal_id = request.query_params.get('terminal_id') or request.data.get('terminal_id')
         accessible_businesses = _get_accessible_business_queryset(request.user)
         business = get_object_or_404(accessible_businesses, id=business_id)
-
+        terminal = None
+        if terminal_id:
+            terminal = get_object_or_404(Terminal, id=terminal_id, business=business)
         try:
-            mapping = ProductMappingService.create_product_mapping(
-                business=business,
-                **serializer.validated_data
+            result = ConfigurationService.ensure_fresh_configuration(
+                business,
+                terminal=terminal,
+                require_success=_parse_bool(request.data.get('require_success'), False),
             )
-
-            return Response(
-                MRAProductMappingSerializer(mapping).data,
-                status=status.HTTP_201_CREATED
-            )
+            return Response(result, status=status.HTTP_200_OK)
         except Exception as e:
-            return Response(
-                {'error': str(e)},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
 
 
 class MRAInvoiceViewSet(viewsets.ModelViewSet):
@@ -952,3 +1325,75 @@ class PreparePendingPOSOrdersView(APIView):
             },
             status=status.HTTP_200_OK
         )
+
+
+class MRAUtilityView(APIView):
+    """Thin wrappers around MRA utility validation endpoints."""
+    permission_classes = [IsAuthenticated]
+
+    def _resolve_business_and_terminal(self, request):
+        business_id = request.query_params.get('business_id') or request.data.get('business_id')
+        terminal_id = request.query_params.get('terminal_id') or request.data.get('terminal_id')
+        accessible_businesses = _get_accessible_business_queryset(request.user)
+        business = get_object_or_404(accessible_businesses, id=business_id)
+        terminal = None
+        if terminal_id:
+            terminal = get_object_or_404(Terminal, id=terminal_id, business=business)
+        return business, terminal
+
+    def post(self, request, action_name):
+        business, terminal = self._resolve_business_and_terminal(request)
+        try:
+            if action_name == 'check-tin-authorization':
+                result = EISSaleComplianceService.check_tin_authorization_requirement(
+                    business=business,
+                    tin=request.data.get('tin') or request.data.get('buyerTIN') or request.data.get('buyerTin') or '',
+                    terminal=terminal,
+                )
+            elif action_name == 'validate-authorization-code':
+                result = EISSaleComplianceService.validate_authorization_code(
+                    business=business,
+                    authorization_code=(
+                        request.data.get('authorizationCode')
+                        or request.data.get('buyerAuthorizationCode')
+                        or request.data.get('authorization_code')
+                        or ''
+                    ),
+                    terminal=terminal,
+                )
+            elif action_name == 'validate-vat5':
+                result = EISSaleComplianceService.validate_vat5_certificate(
+                    business=business,
+                    project_number=request.data.get('projectNumber') or request.data.get('project_number') or '',
+                    certificate_number=(
+                        request.data.get('certificateNumber')
+                        or request.data.get('vat5CertificateNumber')
+                        or request.data.get('certificate_number')
+                        or ''
+                    ),
+                    quantity=request.data.get('quantity') or request.data.get('vat5Quantity') or 0,
+                    terminal=terminal,
+                )
+            elif action_name == 'ping':
+                if terminal is None:
+                    raise ValueError('terminal_id is required for MRA ping.')
+                result = TerminalService.check_terminal_health(terminal)
+            else:
+                return Response({'error': 'Unknown MRA utility action.'}, status=status.HTTP_404_NOT_FOUND)
+            return Response(result, status=status.HTTP_200_OK)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            if _is_mra_network_failure(e):
+                message = 'B2B sales need MRA online.' if action_name in {
+                    'check-tin-authorization',
+                    'validate-authorization-code',
+                } else 'MRA is offline.'
+                return Response(
+                    {
+                        'error': message,
+                        'code': 'mra_network_unreachable',
+                    },
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)

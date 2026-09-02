@@ -21,6 +21,13 @@ def _process_tax_changes(business_id, changes):
         business = Business.objects.get(id=business_id)
     except Business.DoesNotExist:
         return [], [{'error': f'Business {business_id} not found'}]
+
+    if getattr(getattr(business, 'settings', None), 'enable_eis', False):
+        return [], [
+            {
+                'error': 'Local tax sync is disabled because MRA EIS is enabled. Use MRA product tax mappings.'
+            }
+        ]
     
     acknowledged = []
     errors = []

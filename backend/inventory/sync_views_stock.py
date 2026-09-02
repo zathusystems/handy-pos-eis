@@ -5,6 +5,16 @@ Handles synchronization of stock transfers between frontend and backend
 
 from .models import InventoryItem, StockTransfer
 from business.models import Business, Branch
+from .services import InventoryService
+
+
+def _is_valid_uuid(value):
+    try:
+        import uuid
+        uuid.UUID(str(value))
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 # ============================================================================
@@ -27,7 +37,7 @@ def handle_create_stock_transfer(transfer_id, data, business, branch_id):
             }
         
         # Validate to branch exists
-        to_branch_id = data.get('toBranchId')
+        to_branch_id = data.get('toBranchId') or data.get('to_branch_id') or data.get('to_branch') or data.get('branchId')
         if not to_branch_id:
             return {
                 'success': False,
@@ -43,13 +53,17 @@ def handle_create_stock_transfer(transfer_id, data, business, branch_id):
             }
         
         # Check if transfer already exists
-        existing = StockTransfer.objects.filter(id=transfer_id, business=business).first()
+        existing = (
+            StockTransfer.objects.filter(id=transfer_id, business=business).first()
+            if _is_valid_uuid(transfer_id)
+            else None
+        )
         if existing:
             print(f"[Sync Stock] Transfer {transfer_id} already exists, updating instead")
             return handle_update_stock_transfer(transfer_id, data, business, branch_id)
         
         # Get inventory item
-        item_id = data.get('itemId')
+        item_id = data.get('itemId') or data.get('item_id') or data.get('inventoryItemId') or data.get('inventory_item_id')
         if not item_id:
             return {
                 'success': False,
@@ -65,6 +79,23 @@ def handle_create_stock_transfer(transfer_id, data, business, branch_id):
             }
         
         quantity = Decimal(str(data.get('quantity', 0)))
+        try:
+            InventoryService._validate_eis_branch_transfer_mapping(
+                from_branch,
+                to_branch,
+                business,
+            )
+            eis_transfer_result = InventoryService.submit_eis_transfer_if_required(
+                from_branch,
+                to_branch,
+                inventory_item,
+                quantity,
+            )
+        except Exception as exc:
+            return {
+                'success': False,
+                'error': str(exc),
+            }
         
         with transaction.atomic():
             # 1. Decrement stock at source branch
@@ -81,7 +112,6 @@ def handle_create_stock_transfer(transfer_id, data, business, branch_id):
                 branch=to_branch,
                 name=inventory_item.name,
                 defaults={
-                    'id': f"{inventory_item.name.replace(' ', '')}-{to_branch.id}",  # Generate consistent ID
                     'category': inventory_item.category,
                     'item_type': inventory_item.item_type,
                     'unit_type': inventory_item.unit_type,
@@ -123,14 +153,16 @@ def handle_create_stock_transfer(transfer_id, data, business, branch_id):
             
             # 3. Create transfer record
             transfer_data = {
-                'id': transfer_id,
                 'business': business,
                 'from_branch': from_branch,
                 'to_branch': to_branch,
                 'inventory_item': inventory_item,
                 'quantity': quantity,
-                'initiated_by': data.get('initiatedBy', 'System'),
+                'mra_notified': bool(eis_transfer_result),
+                'initiated_by': data.get('initiatedBy') or data.get('initiated_by') or 'System',
             }
+            if _is_valid_uuid(transfer_id):
+                transfer_data['id'] = transfer_id
             
             transfer = StockTransfer.objects.create(**transfer_data)
             print(f"[Sync Stock] Created stock transfer {transfer_id}")

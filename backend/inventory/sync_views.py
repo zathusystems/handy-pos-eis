@@ -136,7 +136,7 @@ def sync_push(request):
                         elif operation == 'update':
                             result = handle_update_purchase_order(entity_id, data, business, branch_id)
                         elif operation == 'delete':
-                            result = handle_delete_purchase_order(entity_id, business, branch_id)
+                            result = handle_delete_purchase_order(entity_id, business, branch_id, data)
                     
                     elif entity_type == 'StockTransfer':
                         if operation == 'create':
@@ -379,13 +379,16 @@ def sync_pull(request):
             suppliers_data.append({
                 'id': str(supplier.id),
                 'name': supplier.name,
+                'contact_person': supplier.contact_person,
                 'email': supplier.email,
                 'phone': supplier.phone,
                 'address': supplier.address,
                 'city': supplier.city,
+                'region': supplier.region,
                 'country': supplier.country,
                 'is_active': supplier.is_active,
                 'supplier_tin': supplier.supplier_tin,
+                'mra_supplier_id': supplier.mra_supplier_id,
                 'vat_registered': supplier.vat_registered,
                 'total_amount_due': float(supplier.total_amount_due),
                 'total_amount_paid': float(supplier.total_amount_paid),

@@ -10,11 +10,10 @@ from decimal import Decimal
 import uuid
 
 from business.models import Business, Branch
-from inventory.models import InventoryItem
+from inventory.models import InventoryItem, MRAProductMapping
 from mra_eis.models import (
     TerminalActivationCode,
     Terminal,
-    MRAProductMapping,
 )
 
 
@@ -68,7 +67,6 @@ class Command(BaseCommand):
         from mra_eis.models import (
             Terminal, TerminalActivationCode, MRAInvoice,
             OfflineInvoiceQueue, InvoiceAuditLog, Receipt,
-            MRAProductMapping
         )
 
         Terminal.objects.filter(terminal_id__startswith='TERM-TEST').delete()
@@ -172,15 +170,16 @@ class Command(BaseCommand):
 
         for i, data in enumerate(product_data):
             product, created = InventoryItem.objects.get_or_create(
-                id=f'PROD-TEST-{i+1:03d}',
+                business=branch.business,
+                branch=branch,
+                name=data['name'],
                 defaults={
-                    'name': data['name'],
                     'category': data['category'],
-                    'itemType': 'sellable',
-                    'branchId': branch.id,
+                    'item_type': 'sellable',
                     'price': Decimal(str(data['price'])),
-                    'stockUnits': data['stock'],
-                    'isProduced': False,
+                    'stock_units': Decimal(str(data['stock'])),
+                    'unit_type': 'unit',
+                    'is_produced': False,
                     'status': 'In Stock',
                 }
             )
@@ -201,19 +200,20 @@ class Command(BaseCommand):
         for i, product in enumerate(products):
             tax_category, tax_rate = tax_categories[i]
 
-            mapping, created = MRAProductMapping.objects.get_or_create(
-                business=business,
-                inventory_item_id=product.id,
+            mapping, created = MRAProductMapping.objects.update_or_create(
+                inventory_item=product,
                 defaults={
-                    'product_name': product.name,
+                    'branch': product.branch,
                     'mra_product_code': f'MRA-PROD-TEST-{i+1:03d}',
                     'mra_product_name': product.name,
-                    'tax_category': tax_category,
-                    'approved_price': Decimal(str(product.price)),
-                    'tax_rate': Decimal(str(tax_rate)),
+                    'mra_tax_type': tax_category,
+                    'mra_tax_rate': Decimal(str(tax_rate)),
+                    'mra_unit_measure': 'unit',
+                    'tax_calculation_method': 'inclusive',
                     'is_approved': True,
-                    'is_active': True,
                     'approved_at': timezone.now(),
+                    'mra_synced': True,
+                    'last_synced_at': timezone.now(),
                 }
             )
             mappings.append(mapping)

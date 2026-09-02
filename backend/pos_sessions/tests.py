@@ -1,17 +1,19 @@
 import uuid
 from decimal import Decimal
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient, APIRequestFactory, force_authenticate
 
-from business.models import Business, Branch
+from business.models import Business, Branch, BusinessSettings
 from inventory.models import InventoryItem, MRAProductMapping, PurchaseOrder, PurchaseOrderItem
+from pos_sessions.correction_serializers import VoidTransactionSerializer
 from pos_sessions.correction_views import VoidTransactionViewSet
-from pos_sessions.models import Order, OrderItem, Session
-from pos_sessions.sync_views import decrement_inventory_for_order
+from pos_sessions.models import Order, OrderItem, Session, VoidTransaction
+from pos_sessions.sync_views import InsufficientStockError, decrement_inventory_for_order
 from staff.models import Staff, StaffRole
 
 User = get_user_model()
@@ -134,6 +136,21 @@ class OrderBatchTraceAndVoidTests(TestCase):
         self.assertEqual(trace['batch_id'], str(self.batch_1.id))
         self.assertEqual(Decimal(trace['quantity']), Decimal('4.000'))
 
+    def test_decrement_blocks_when_quantity_exceeds_available_stock(self):
+        order, _ = self._create_order_with_single_item(order_number=1099, quantity='11.000')
+
+        with self.assertRaises(InsufficientStockError) as context:
+            decrement_inventory_for_order(order, self.branch, self.business)
+
+        self.assertIn('Insufficient stock for Milk 1L', str(context.exception))
+
+        self.inventory_item.refresh_from_db()
+        self.batch_1.refresh_from_db()
+        self.batch_2.refresh_from_db()
+        self.assertEqual(self.inventory_item.stock_units, Decimal('10.000'))
+        self.assertEqual(self.batch_1.quantity_remaining, Decimal('5.000'))
+        self.assertEqual(self.batch_2.quantity_remaining, Decimal('5.000'))
+
     def test_void_restores_original_batches_even_after_other_sales(self):
         # Order A uses 4 from old batch.
         order_a, order_item_a = self._create_order_with_single_item(order_number=1002, quantity='4.000')
@@ -236,6 +253,67 @@ class OrderBatchTraceAndVoidTests(TestCase):
         self.assertEqual(self.batch_1.quantity_remaining, Decimal('1.000'))
         self.assertEqual(self.inventory_item.stock_units, Decimal('3.000'))
 
+    def test_eis_void_submits_correction_and_preserves_stock_reversal(self):
+        BusinessSettings.objects.update_or_create(
+            business=self.business,
+            defaults={'enable_eis': True},
+        )
+
+        order, _ = self._create_order_with_single_item(order_number=1005, quantity='2.000')
+        decrement_inventory_for_order(order, self.branch, self.business)
+        order.fiscal_invoice_number = 'FISCAL-VOID-1005'
+        order.eis_status = 'SUBMITTED'
+        order.eis_uuid = 'original-sale-uuid'
+        order.save(update_fields=['fiscal_invoice_number', 'eis_status', 'eis_uuid', 'updated_at'])
+
+        factory = APIRequestFactory()
+        request = factory.post(
+            '/sessions/void-transactions/create_void/',
+            {
+                'original_order_id': str(order.id),
+                'void_reason': 'customer_request',
+                'reason_description': 'EIS void correction with stock reversal',
+                'supporting_documents': ['RETURN-SLIP-1005', 'https://docs.example/void-1005'],
+                'refund_method': 'cash',
+                'refund_amount': '1.00',
+            },
+            format='json',
+        )
+        force_authenticate(request, user=self.user)
+
+        with patch('pos_sessions.correction_views.CorrectionService.submit_void_transaction') as submit_void:
+            submit_void.return_value = {
+                'eis_status': 'SUBMITTED',
+                'dry_run': False,
+                'endpoint': 'cancel_receipt',
+            }
+            response = VoidTransactionViewSet.as_view({'post': 'create_void'})(request)
+
+        self.assertEqual(response.status_code, 201)
+        submit_void.assert_called_once()
+
+        self.batch_1.refresh_from_db()
+        self.batch_2.refresh_from_db()
+        self.inventory_item.refresh_from_db()
+        order.refresh_from_db()
+
+        self.assertEqual(self.batch_1.quantity_remaining, Decimal('5.000'))
+        self.assertEqual(self.batch_2.quantity_remaining, Decimal('5.000'))
+        self.assertEqual(self.inventory_item.stock_units, Decimal('10.000'))
+        self.assertEqual(order.status, 'Voided')
+        self.assertEqual(response.data['eis_result']['endpoint'], 'cancel_receipt')
+
+        void_transaction = VoidTransaction.objects.get(original_order=order)
+        serialized = VoidTransactionSerializer(void_transaction).data
+        self.assertIn('refund_amount', serialized)
+        self.assertIn('refund_processed', serialized)
+        self.assertEqual(Decimal(serialized['refund_amount']), Decimal('1.00'))
+        self.assertTrue(serialized['refund_processed'])
+        self.assertEqual(
+            serialized['supporting_documents'],
+            'RETURN-SLIP-1005\nhttps://docs.example/void-1005',
+        )
+
 
 class SyncPushOrderTests(TestCase):
     def setUp(self):
@@ -246,6 +324,10 @@ class SyncPushOrderTests(TestCase):
         self.business = Business.objects.create(
             owner=self.user,
             name='Sync Push Test Business',
+        )
+        BusinessSettings.objects.update_or_create(
+            business=self.business,
+            defaults={'block_sales_if_tax_mapping_missing': True},
         )
         self.branch = Branch.objects.create(
             business=self.business,
@@ -415,6 +497,92 @@ class SyncPushOrderTests(TestCase):
         self.inventory_item.refresh_from_db()
         self.assertEqual(self.inventory_item.stock_units, Decimal('9.000'))
 
+    def test_sync_push_blocks_order_when_quantity_exceeds_available_stock(self):
+        order_id = str(uuid.uuid4())
+        payload = self._build_sync_payload(order_id)
+        item_payload = payload['changes'][0]['data']['items'][0]
+        item_payload['quantity'] = 11
+        payload['changes'][0]['data']['subtotal'] = 55.0
+        payload['changes'][0]['data']['total'] = 55.0
+
+        response = self.client.post('/sessions/sync/push/', payload, format='json')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Order.objects.filter(id=order_id).count(), 0)
+        self.assertEqual(len(response.data['results']['acknowledged']), 0)
+        self.assertTrue(response.data['results']['errors'])
+        self.assertEqual(response.data['results']['errors'][0].get('reason'), 'insufficient_stock')
+        self.assertIn('Insufficient stock for Soda Can', response.data['results']['errors'][0]['error'])
+
+        self.inventory_item.refresh_from_db()
+        self.assertEqual(self.inventory_item.stock_units, Decimal('10.000'))
+
+    def test_direct_order_create_blocks_when_quantity_exceeds_available_stock(self):
+        payload = {
+            'branch': self.branch.id,
+            'session': str(self.session.id),
+            'orderNumber': 7201,
+            'orderType': 'sale',
+            'status': 'Completed',
+            'paymentMethod': 'Cash',
+            'subtotal': 55.0,
+            'total': 55.0,
+            'cogs': 0,
+            'items': [
+                {
+                    'id': str(uuid.uuid4()),
+                    'inventoryItemId': str(self.inventory_item.id),
+                    'name': self.inventory_item.name,
+                    'quantity': 11,
+                    'price': 5.0,
+                    'notes': '',
+                }
+            ],
+        }
+
+        response = self.client.post('/sessions/orders/', payload, format='json')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('Insufficient stock for Soda Can', str(response.data))
+        self.assertFalse(Order.objects.filter(order_number=7201, branch=self.branch).exists())
+
+        self.inventory_item.refresh_from_db()
+        self.assertEqual(self.inventory_item.stock_units, Decimal('10.000'))
+
+    def test_direct_order_create_blocks_discount_equal_to_item_total(self):
+        payload = {
+            'branch': self.branch.id,
+            'session': str(self.session.id),
+            'orderNumber': 7202,
+            'orderType': 'sale',
+            'status': 'Completed',
+            'paymentMethod': 'Cash',
+            'subtotal': 0.0,
+            'total': 0.0,
+            'cogs': 0,
+            'items': [
+                {
+                    'id': str(uuid.uuid4()),
+                    'inventoryItemId': str(self.inventory_item.id),
+                    'name': self.inventory_item.name,
+                    'quantity': 1,
+                    'price': 5.0,
+                    'notes': '',
+                    'discountRuleId': 'full-discount',
+                    'discountName': 'Invalid Full Discount',
+                    'discountType': 'fixed',
+                    'discountValue': 5.0,
+                    'discountAmount': 5.0,
+                }
+            ],
+        }
+
+        response = self.client.post('/sessions/orders/', payload, format='json')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('Discount must be less than the item total', str(response.data))
+        self.assertFalse(Order.objects.filter(order_number=7202, branch=self.branch).exists())
+
     def test_sync_push_variable_price_keeps_unit_price_and_fractional_quantity(self):
         self.inventory_item.is_variable_price = True
         self.inventory_item.price = Decimal('40.00')
@@ -513,6 +681,85 @@ class SyncPushOrderTests(TestCase):
         self.assertAlmostEqual(float(created_item.subtotal), 100.0, places=2)
         self.assertAlmostEqual(float(created_item.tax_amount), 16.5, places=2)
         self.assertAlmostEqual(float(created_item.total), 116.5, places=2)
+
+    def test_sync_push_discount_recalculates_eis_vat_from_discounted_amount(self):
+        mapping = MRAProductMapping.objects.get(inventory_item=self.inventory_item, branch=self.branch)
+        mapping.mra_tax_rate = Decimal('16.50')
+        mapping.tax_calculation_method = 'inclusive'
+        mapping.save(update_fields=['mra_tax_rate', 'tax_calculation_method', 'updated_at'])
+
+        order_id = str(uuid.uuid4())
+        payload = self._build_sync_payload(order_id)
+        payload['changes'][0]['data']['subtotal'] = 77.25
+        payload['changes'][0]['data']['total'] = 90.00
+        item_payload = payload['changes'][0]['data']['items'][0]
+        item_payload.update({
+            'price': 100.0,
+            'discountRuleId': 'promo-10',
+            'discountName': 'Promo 10%',
+            'discountType': 'percentage',
+            'discountValue': 10,
+            'discountAmount': 10.0,
+        })
+
+        response = self.client.post('/sessions/sync/push/', payload, format='json')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['results']['errors'], [])
+        created_order = Order.objects.get(id=order_id)
+        created_item = created_order.items.get()
+
+        self.assertAlmostEqual(float(created_order.discount_amount), 10.0, places=2)
+        self.assertAlmostEqual(float(created_order.gross_amount), 90.0, places=2)
+        self.assertAlmostEqual(float(created_order.vat_amount), 12.75, places=2)
+        self.assertAlmostEqual(float(created_order.net_amount), 77.25, places=2)
+        self.assertEqual(created_item.discount_rule_id, 'promo-10')
+        self.assertEqual(created_item.discount_name, 'Promo 10%')
+        self.assertAlmostEqual(float(created_item.discount_amount), 10.0, places=2)
+        self.assertAlmostEqual(float(created_item.total), 90.0, places=2)
+        self.assertAlmostEqual(float(created_item.tax_amount), 12.75, places=2)
+
+    def test_sync_push_blocks_fixed_discount_equal_to_item_total(self):
+        order_id = str(uuid.uuid4())
+        payload = self._build_sync_payload(order_id)
+        item_payload = payload['changes'][0]['data']['items'][0]
+        item_payload.update({
+            'price': 5.0,
+            'discountRuleId': 'full-discount',
+            'discountName': 'Invalid Full Discount',
+            'discountType': 'fixed',
+            'discountValue': 5.0,
+            'discountAmount': 5.0,
+        })
+
+        response = self.client.post('/sessions/sync/push/', payload, format='json')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Order.objects.filter(id=order_id).count(), 0)
+        self.assertEqual(len(response.data['results']['acknowledged']), 0)
+        self.assertTrue(response.data['results']['errors'])
+        self.assertIn('Discount for Soda Can must be less than the item total', response.data['results']['errors'][0]['error'])
+
+    def test_sync_push_blocks_percentage_discount_of_one_hundred_percent(self):
+        order_id = str(uuid.uuid4())
+        payload = self._build_sync_payload(order_id)
+        item_payload = payload['changes'][0]['data']['items'][0]
+        item_payload.update({
+            'price': 5.0,
+            'discountRuleId': 'full-percent-discount',
+            'discountName': 'Invalid 100%',
+            'discountType': 'percentage',
+            'discountValue': 100,
+            'discountAmount': 5.0,
+        })
+
+        response = self.client.post('/sessions/sync/push/', payload, format='json')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Order.objects.filter(id=order_id).count(), 0)
+        self.assertEqual(len(response.data['results']['acknowledged']), 0)
+        self.assertTrue(response.data['results']['errors'])
+        self.assertIn('Discount for Soda Can must be less than the item total', response.data['results']['errors'][0]['error'])
 
     def test_sync_push_blocks_products_with_unsynced_mra_mapping(self):
         mapping = MRAProductMapping.objects.get(inventory_item=self.inventory_item, branch=self.branch)

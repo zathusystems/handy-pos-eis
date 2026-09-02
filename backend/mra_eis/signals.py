@@ -4,6 +4,7 @@ MRA EIS Signals - Background tasks and event handlers
 from django.db.models.signals import post_save, post_delete
 from django.dispatch import receiver
 from django.utils import timezone
+from django.conf import settings
 from .models import Terminal, MRAInvoice, OfflineInvoiceQueue, TerminalAuditLog
 from .services import RetryService
 
@@ -31,6 +32,8 @@ def on_terminal_created(sender, instance, created, **kwargs):
 def on_invoice_status_changed(sender, instance, created, **kwargs):
     """Handle invoice status changes"""
     if not created and instance.status == 'offline_queued':
+        if bool(getattr(settings, 'MRA_EIS_ALWAYS_OFFLINE_B2C', False)):
+            return
         # Auto-sync if terminal is online
         if instance.terminal.is_online:
             try:

@@ -8,6 +8,70 @@ from business.models import Business, Branch
 User = get_user_model()
 
 
+class DiscountRule(models.Model):
+    """Admin-managed POS discount rule used for fiscal sale calculations."""
+    DISCOUNT_TYPE_CHOICES = [
+        ('percentage', 'Percentage'),
+        ('fixed', 'Fixed Amount'),
+    ]
+    SCOPE_CHOICES = [
+        ('all', 'All Products'),
+        ('products', 'Selected Products'),
+        ('categories', 'Selected Categories'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    business = models.ForeignKey(Business, on_delete=models.CASCADE, related_name='discount_rules')
+    branch = models.ForeignKey(Branch, on_delete=models.CASCADE, related_name='discount_rules', null=True, blank=True)
+    name = models.CharField(max_length=120)
+    discount_type = models.CharField(max_length=20, choices=DISCOUNT_TYPE_CHOICES)
+    value = models.DecimalField(max_digits=12, decimal_places=2)
+    applies_to = models.CharField(max_length=20, choices=SCOPE_CHOICES, default='all')
+    product_ids = models.JSONField(default=list, blank=True)
+    categories = models.JSONField(default=list, blank=True)
+    starts_at = models.DateTimeField(null=True, blank=True)
+    ends_at = models.DateTimeField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    requires_manager_approval = models.BooleanField(default=False)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='created_discount_rules')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+        indexes = [
+            models.Index(fields=['business', 'branch', 'is_active']),
+            models.Index(fields=['discount_type']),
+            models.Index(fields=['starts_at', 'ends_at']),
+        ]
+
+    def __str__(self):
+        return f'{self.name} ({self.discount_type}: {self.value})'
+
+    def clean(self):
+        super().clean()
+        if self.value < 0:
+            raise ValidationError('Discount value cannot be negative.')
+        if self.discount_type == 'percentage' and self.value > 99:
+            raise ValidationError('Percentage discount cannot exceed 99%.')
+        if self.applies_to == 'products' and not isinstance(self.product_ids, list):
+            raise ValidationError('Product discount scope must contain a product list.')
+        if self.applies_to == 'categories' and not isinstance(self.categories, list):
+            raise ValidationError('Category discount scope must contain a category list.')
+        if self.starts_at and self.ends_at and self.ends_at <= self.starts_at:
+            raise ValidationError('Discount end date must be after start date.')
+
+    def is_currently_active(self, at_time=None):
+        at_time = at_time or timezone.now()
+        if not self.is_active:
+            return False
+        if self.starts_at and self.starts_at > at_time:
+            return False
+        if self.ends_at and self.ends_at < at_time:
+            return False
+        return True
+
+
 class Session(models.Model):
     """POS Session model for tracking sales sessions"""
     STATUS_CHOICES = [
@@ -131,9 +195,20 @@ class Order(models.Model):
     customer_notes = models.TextField(blank=True, null=True)
     buyer_name = models.CharField(max_length=255, blank=True, null=True)
     buyer_tin = models.CharField(max_length=50, blank=True, null=True)
+
+    # EIS special sale fields
+    buyer_authorization_code = models.CharField(max_length=100, blank=True, null=True)
+    is_export = models.BooleanField(default=False)
+    is_relief_supply = models.BooleanField(default=False)
+    vat5_project_number = models.CharField(max_length=100, blank=True, null=True)
+    vat5_certificate_number = models.CharField(max_length=100, blank=True, null=True)
+    vat5_quantity = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)
+    eis_validation_metadata = models.JSONField(default=dict, blank=True)
     
     # Pricing
     subtotal = models.DecimalField(max_digits=12, decimal_places=2)
+    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    discount_metadata = models.JSONField(default=dict, blank=True)
     total = models.DecimalField(max_digits=12, decimal_places=2)
     
     # Tax snapshot (MRA compliance - NEVER calculate tax dynamically)
@@ -225,6 +300,9 @@ class Order(models.Model):
 
         if self.eis_status == 'SUBMITTED':
             self.is_fiscal_locked = True
+            update_fields = kwargs.get('update_fields')
+            if update_fields is not None:
+                kwargs['update_fields'] = list(set(update_fields) | {'is_fiscal_locked'})
 
         super().save(*args, **kwargs)
 
@@ -245,6 +323,11 @@ class OrderItem(models.Model):
     quantity = models.DecimalField(max_digits=12, decimal_places=3)
     price = models.DecimalField(max_digits=12, decimal_places=2, default=0, help_text="Unit price")
     notes = models.TextField(blank=True)
+    discount_rule_id = models.CharField(max_length=100, blank=True, null=True)
+    discount_name = models.CharField(max_length=120, blank=True)
+    discount_type = models.CharField(max_length=20, blank=True)
+    discount_value = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     
     # MRA PRODUCT MAPPING
     mra_product_code = models.CharField(max_length=100, blank=True, null=True)
@@ -402,6 +485,22 @@ class CreditNote(models.Model):
     def __str__(self):
         return f"Credit Note {self.credit_note_number} - {self.reason}"
 
+    def save(self, *args, **kwargs):
+        if self.pk and not kwargs.get('force_insert', False):
+            existing = CreditNote.objects.filter(pk=self.pk).only('is_fiscal_locked').first()
+            if existing and existing.is_fiscal_locked:
+                update_fields = set(kwargs.get('update_fields') or [])
+                if not update_fields or not update_fields.issubset({'is_dirty', 'updated_at'}):
+                    raise ValidationError("Cannot modify a locked fiscal credit note.")
+
+        if self.eis_status in {'SUBMITTED', 'ACCEPTED'}:
+            self.is_fiscal_locked = True
+            update_fields = kwargs.get('update_fields')
+            if update_fields is not None:
+                kwargs['update_fields'] = list(set(update_fields) | {'is_fiscal_locked'})
+
+        super().save(*args, **kwargs)
+
     def mark_dirty(self):
         self.is_dirty = True
         self.save(update_fields=['is_dirty'])
@@ -465,6 +564,22 @@ class DebitNote(models.Model):
     def __str__(self):
         return f"Debit Note {self.debit_note_number}"
 
+    def save(self, *args, **kwargs):
+        if self.pk and not kwargs.get('force_insert', False):
+            existing = DebitNote.objects.filter(pk=self.pk).only('is_fiscal_locked').first()
+            if existing and existing.is_fiscal_locked:
+                update_fields = set(kwargs.get('update_fields') or [])
+                if not update_fields or not update_fields.issubset({'is_dirty', 'updated_at'}):
+                    raise ValidationError("Cannot modify a locked fiscal debit note.")
+
+        if self.eis_status in {'SUBMITTED', 'ACCEPTED'}:
+            self.is_fiscal_locked = True
+            update_fields = kwargs.get('update_fields')
+            if update_fields is not None:
+                kwargs['update_fields'] = list(set(update_fields) | {'is_fiscal_locked'})
+
+        super().save(*args, **kwargs)
+
     def mark_dirty(self):
         self.is_dirty = True
         self.save(update_fields=['is_dirty'])
@@ -495,7 +610,12 @@ class VoidTransaction(models.Model):
     void_number = models.CharField(max_length=100, unique=True)
     void_reason = models.CharField(max_length=50, choices=VOID_REASON_CHOICES)
     reason_description = models.TextField(help_text="Detailed explanation of why the sale was voided")
-    
+    supporting_documents = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Optional supporting document references sent with the MRA EIS void/cancel request",
+    )
+
     # Cancellation details
     voided_amount = models.DecimalField(max_digits=12, decimal_places=2, help_text="Total amount voided")
     voided_vat = models.DecimalField(max_digits=12, decimal_places=2, help_text="VAT amount voided")
@@ -558,6 +678,22 @@ class VoidTransaction(models.Model):
 
     def __str__(self):
         return f"Void Transaction {self.void_number} - {self.void_reason}"
+
+    def save(self, *args, **kwargs):
+        if self.pk and not kwargs.get('force_insert', False):
+            existing = VoidTransaction.objects.filter(pk=self.pk).only('is_fiscal_locked').first()
+            if existing and existing.is_fiscal_locked:
+                update_fields = set(kwargs.get('update_fields') or [])
+                if not update_fields or not update_fields.issubset({'is_dirty', 'updated_at'}):
+                    raise ValidationError("Cannot modify a locked fiscal void transaction.")
+
+        if self.eis_status in {'SUBMITTED', 'ACCEPTED'}:
+            self.is_fiscal_locked = True
+            update_fields = kwargs.get('update_fields')
+            if update_fields is not None:
+                kwargs['update_fields'] = list(set(update_fields) | {'is_fiscal_locked'})
+
+        super().save(*args, **kwargs)
 
     def mark_dirty(self):
         self.is_dirty = True

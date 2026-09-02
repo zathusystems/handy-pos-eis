@@ -6,6 +6,8 @@ from django.db import transaction
 from django.utils import timezone
 import uuid
 
+from mra_eis.services import CorrectionService
+
 from .models import CreditNote, DebitNote, VoidTransaction, Order
 from .correction_serializers import (
     CreditNoteSerializer,
@@ -15,6 +17,37 @@ from .correction_serializers import (
     CreateDebitNoteSerializer,
     CreateVoidTransactionSerializer,
 )
+
+
+def _accessible_business_ids(user):
+    if getattr(user, 'is_superuser', False):
+        from business.models import Business
+
+        return Business.objects.values_list('id', flat=True)
+
+    business_ids = []
+    try:
+        from business.models import Business
+
+        business_ids.extend(Business.objects.filter(owner=user).values_list('id', flat=True))
+    except Exception:
+        pass
+
+    try:
+        from staff.models import Staff
+
+        business_ids.extend(
+            Staff.objects.filter(user=user, is_active=True).values_list('business_id', flat=True)
+        )
+    except Exception:
+        pass
+
+    return list(dict.fromkeys(business_ids))
+
+
+def _should_submit_eis_correction(order):
+    business_settings = getattr(order.business, 'settings', None)
+    return bool(getattr(business_settings, 'enable_eis', False)) or bool(order.fiscal_invoice_number)
 
 
 class CreditNoteViewSet(viewsets.ModelViewSet):
@@ -28,7 +61,7 @@ class CreditNoteViewSet(viewsets.ModelViewSet):
         user = self.request.user
         branch_id = self.request.query_params.get('branch_id')
         
-        queryset = CreditNote.objects.all()
+        queryset = CreditNote.objects.filter(business_id__in=_accessible_business_ids(user))
         
         if branch_id:
             queryset = queryset.filter(branch_id=branch_id)
@@ -43,7 +76,10 @@ class CreditNoteViewSet(viewsets.ModelViewSet):
         
         try:
             with transaction.atomic():
-                order = Order.objects.get(id=serializer.validated_data['original_order_id'])
+                order = Order.objects.get(
+                    id=serializer.validated_data['original_order_id'],
+                    business_id__in=_accessible_business_ids(request.user),
+                )
                 
                 # Generate credit note number
                 credit_note_number = f"CN-{timezone.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
@@ -62,11 +98,17 @@ class CreditNoteViewSet(viewsets.ModelViewSet):
                     created_by=request.user,
                 )
                 
-                # Mark as dirty for syncing
-                credit_note.mark_dirty()
+                eis_result = None
+                if _should_submit_eis_correction(order):
+                    eis_result = CorrectionService.submit_credit_note(credit_note)
+                else:
+                    credit_note.mark_dirty()
+
+                response_data = dict(CreditNoteSerializer(credit_note).data)
+                response_data['eis_result'] = eis_result
                 
                 return Response(
-                    CreditNoteSerializer(credit_note).data,
+                    response_data,
                     status=status.HTTP_201_CREATED
                 )
         except Order.DoesNotExist:
@@ -91,7 +133,10 @@ class CreditNoteViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        credit_notes = CreditNote.objects.filter(original_order_id=order_id)
+        credit_notes = CreditNote.objects.filter(
+            original_order_id=order_id,
+            business_id__in=_accessible_business_ids(request.user),
+        ).order_by('-created_at')
         serializer = CreditNoteSerializer(credit_notes, many=True)
         
         return Response(serializer.data)
@@ -107,7 +152,7 @@ class DebitNoteViewSet(viewsets.ModelViewSet):
         """Filter by branch"""
         branch_id = self.request.query_params.get('branch_id')
         
-        queryset = DebitNote.objects.all()
+        queryset = DebitNote.objects.filter(business_id__in=_accessible_business_ids(self.request.user))
         
         if branch_id:
             queryset = queryset.filter(branch_id=branch_id)
@@ -122,7 +167,10 @@ class DebitNoteViewSet(viewsets.ModelViewSet):
         
         try:
             with transaction.atomic():
-                order = Order.objects.get(id=serializer.validated_data['original_order_id'])
+                order = Order.objects.get(
+                    id=serializer.validated_data['original_order_id'],
+                    business_id__in=_accessible_business_ids(request.user),
+                )
                 
                 # Generate debit note number
                 debit_note_number = f"DN-{timezone.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
@@ -140,11 +188,17 @@ class DebitNoteViewSet(viewsets.ModelViewSet):
                     created_by=request.user,
                 )
                 
-                # Mark as dirty for syncing
-                debit_note.mark_dirty()
+                eis_result = None
+                if _should_submit_eis_correction(order):
+                    eis_result = CorrectionService.submit_debit_note(debit_note)
+                else:
+                    debit_note.mark_dirty()
+
+                response_data = dict(DebitNoteSerializer(debit_note).data)
+                response_data['eis_result'] = eis_result
                 
                 return Response(
-                    DebitNoteSerializer(debit_note).data,
+                    response_data,
                     status=status.HTTP_201_CREATED
                 )
         except Order.DoesNotExist:
@@ -169,7 +223,10 @@ class DebitNoteViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        debit_notes = DebitNote.objects.filter(original_order_id=order_id)
+        debit_notes = DebitNote.objects.filter(
+            original_order_id=order_id,
+            business_id__in=_accessible_business_ids(request.user),
+        ).order_by('-created_at')
         serializer = DebitNoteSerializer(debit_notes, many=True)
         
         return Response(serializer.data)
@@ -208,7 +265,7 @@ class VoidTransactionViewSet(viewsets.ModelViewSet):
         """Filter by branch"""
         branch_id = self.request.query_params.get('branch_id')
         
-        queryset = VoidTransaction.objects.all()
+        queryset = VoidTransaction.objects.filter(business_id__in=_accessible_business_ids(self.request.user))
         
         if branch_id:
             queryset = queryset.filter(branch_id=branch_id)
@@ -238,7 +295,8 @@ class VoidTransactionViewSet(viewsets.ModelViewSet):
 
         try:
             order = Order.objects.select_related('business').get(
-                id=serializer.validated_data['original_order_id']
+                id=serializer.validated_data['original_order_id'],
+                business_id__in=_accessible_business_ids(request.user),
             )
         except Order.DoesNotExist:
             return Response(
@@ -543,18 +601,49 @@ class VoidTransactionViewSet(viewsets.ModelViewSet):
                     void_number=void_number,
                     void_reason=serializer.validated_data.get('void_reason', 'other'),
                     reason_description=serializer.validated_data['reason_description'],
+                    supporting_documents=serializer.validated_data.get('supporting_documents', []),
                     voided_amount=order.net_amount,
                     voided_vat=order.vat_amount,
+                    refund_method=serializer.validated_data.get('refund_method', 'none'),
+                    refund_amount=serializer.validated_data.get('refund_amount', Decimal('0.00')),
+                    refund_processed=(
+                        serializer.validated_data.get('refund_method', 'none') != 'none'
+                        and serializer.validated_data.get('refund_amount', Decimal('0.00')) > 0
+                    ),
+                    refund_processed_at=(
+                        timezone.now()
+                        if serializer.validated_data.get('refund_method', 'none') != 'none'
+                        and serializer.validated_data.get('refund_amount', Decimal('0.00')) > 0
+                        else None
+                    ),
+                    refund_processed_by=(
+                        request.user
+                        if serializer.validated_data.get('refund_method', 'none') != 'none'
+                        and serializer.validated_data.get('refund_amount', Decimal('0.00')) > 0
+                        else None
+                    ),
                     created_by=request.user,
                 )
+
+                eis_result = None
+                if _should_submit_eis_correction(order):
+                    eis_result = CorrectionService.submit_void_transaction(void_transaction)
+                else:
+                    void_transaction.mark_dirty()
                 
-                # Update order status to Voided
-                order.status = 'Voided'
-                order.is_dirty = True
-                order.save(update_fields=['status', 'is_dirty', 'updated_at'])
-                
-                # Mark as dirty for syncing
-                void_transaction.mark_dirty()
+                # Keep fiscal identity immutable, but mark the local sale state
+                # as voided after the correcting document has been recorded.
+                if order.is_fiscal_locked:
+                    Order.objects.filter(pk=order.pk).update(
+                        status='Voided',
+                        is_dirty=True,
+                        updated_at=timezone.now(),
+                    )
+                    order.refresh_from_db()
+                else:
+                    order.status = 'Voided'
+                    order.is_dirty = True
+                    order.save(update_fields=['status', 'is_dirty', 'updated_at'])
                 
                 print(f"[Void] Void transaction created: {void_number}, Stock restored for order {order.id}")
                 
@@ -563,7 +652,8 @@ class VoidTransactionViewSet(viewsets.ModelViewSet):
                 
                 response_data = {
                     'void_transaction': VoidTransactionSerializer(void_transaction).data,
-                    'order': OrderSerializer(order).data
+                    'order': OrderSerializer(order).data,
+                    'eis_result': eis_result,
                 }
                 
                 return Response(response_data, status=status.HTTP_201_CREATED)
@@ -585,7 +675,10 @@ class VoidTransactionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        void_transactions = VoidTransaction.objects.filter(original_order_id=order_id)
+        void_transactions = VoidTransaction.objects.filter(
+            original_order_id=order_id,
+            business_id__in=_accessible_business_ids(request.user),
+        ).order_by('-created_at')
         serializer = VoidTransactionSerializer(void_transactions, many=True)
         
         return Response(serializer.data)

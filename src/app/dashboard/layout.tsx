@@ -2126,7 +2126,7 @@ export default function DashboardLayout({
 
   if (loading || !user) {
     return (
-        <div className="flex h-screen items-center justify-center">
+        <div className="flex h-screen h-[100dvh] items-center justify-center">
             <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
         </div>
     );
@@ -2134,13 +2134,13 @@ export default function DashboardLayout({
 
   return (
     <SidebarProvider>
-      <div className="flex h-screen w-full">
+      <div className="flex h-screen h-[100dvh] w-full">
         <Sidebar className="hidden lg:flex lg:flex-col">
            <AppSidebar user={user} onPosClick={handleOpenPos} />
         </Sidebar>
-        <div className="flex-1 flex flex-col overflow-y-auto">
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
           <Header onPosClick={handleOpenPos} />
-          <main className="tauri-android-safe-bottom flex-1 w-full bg-background/95">
+          <main className="tauri-android-safe-bottom min-h-0 w-full flex-1 bg-background/95">
             <div className="mx-auto flex h-full w-full max-w-[1540px] flex-col px-4 py-4 sm:px-6 lg:px-8 xl:py-6 2xl:px-10">
               {eisActivationGate.required && (
                 <div className="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-amber-950 dark:text-amber-200">

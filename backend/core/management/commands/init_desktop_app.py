@@ -12,7 +12,7 @@ User = get_user_model()
 
 
 class Command(BaseCommand):
-    help = 'Initialize the Handy POS desktop application'
+    help = 'Initialize the HandyPOS desktop application'
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -32,7 +32,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        self.stdout.write(self.style.SUCCESS('Initializing Handy POS Desktop App...'))
+        self.stdout.write(self.style.SUCCESS('Initializing HandyPOS Desktop App...'))
         
         # Run migrations
         self.stdout.write('Running migrations...')

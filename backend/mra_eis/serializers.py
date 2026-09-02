@@ -3,7 +3,7 @@ MRA EIS Serializers - API request/response serialization
 """
 from rest_framework import serializers
 from .models import (
-    Terminal, TerminalActivationCode, MRAConfiguration, MRAProductMapping,
+    Terminal, TerminalActivationCode, MRAConfiguration,
     MRAInvoice, OfflineInvoiceQueue, Receipt, InvoiceAuditLog,
     TerminalAuditLog, MRAAPIError, SyncRetryQueue
 )
@@ -17,28 +17,67 @@ class TerminalActivationCodeSerializer(serializers.ModelSerializer):
 
 
 class TerminalSerializer(serializers.ModelSerializer):
+    blocking_status = serializers.SerializerMethodField()
+
     class Meta:
         model = Terminal
         fields = [
-            'id', 'business', 'branch', 'terminal_id', 'device_serial', 'mac_address',
-            'pos_name', 'pos_version', 'os_type',
-            'status', 'is_online',
+            'id', 'business', 'branch', 'terminal_id', 'mra_terminal_id',
+            'device_serial', 'mac_address',
+            'pos_name', 'pos_version', 'os_type', 'mra_taxpayer_id', 'terminal_position',
+            'status', 'is_online', 'blocking_status',
             'online_invoice_counter', 'offline_invoice_counter',
             'activated_at', 'last_sync_at', 'created_at', 'updated_at'
         ]
         read_only_fields = [
-            'id', 'business', 'branch', 'terminal_id', 'online_invoice_counter',
-            'offline_invoice_counter', 'activated_at', 'last_sync_at',
+            'id', 'business', 'branch', 'terminal_id', 'mra_terminal_id',
+            'blocking_status', 'online_invoice_counter', 'offline_invoice_counter',
+            'activated_at', 'last_sync_at',
             'created_at', 'updated_at'
         ]
 
+    def get_blocking_status(self, obj):
+        try:
+            from .services import TerminalService
+
+            return TerminalService.get_cached_blocking_status(obj)
+        except Exception:
+            return None
+
 
 class TerminalDetailSerializer(TerminalSerializer):
-    """Detailed terminal info with sensitive data"""
+    """Detailed terminal info without TAC, token, or API secret exposure."""
+    activation_result = serializers.SerializerMethodField()
+    has_mra_token = serializers.SerializerMethodField()
+
     class Meta(TerminalSerializer.Meta):
         fields = TerminalSerializer.Meta.fields + [
-            'mra_terminal_id', 'token_expires_at'
+            'token_expires_at', 'has_mra_token', 'activation_result'
         ]
+
+    def get_has_mra_token(self, obj):
+        return bool(getattr(obj, 'mra_token', ''))
+
+    def get_activation_result(self, obj):
+        audit = obj.audit_logs.filter(action='activated').order_by('-created_at').first()
+        if not audit:
+            return None
+
+        details = audit.details if isinstance(audit.details, dict) else {}
+        response = details.get('response') if isinstance(details.get('response'), dict) else {}
+        dry_run = bool(details.get('dry_run', False))
+
+        return {
+            'state': details.get('state') or ('prepared' if dry_run else obj.status),
+            'dry_run': dry_run,
+            'dry_run_reason': details.get('dry_run_reason') or response.get('reason') or '',
+            'endpoint': details.get('endpoint') or '',
+            'status_code': details.get('status_code'),
+            'confirmation_state': details.get('confirmation_state') or '',
+            'error': details.get('error') or response.get('error') or '',
+            'activation_response_shape': details.get('activation_response_shape') or {},
+            'created_at': audit.created_at,
+        }
 
 
 class TerminalActivationSerializer(serializers.Serializer):
@@ -56,32 +95,10 @@ class MRAConfigurationSerializer(serializers.ModelSerializer):
         model = MRAConfiguration
         fields = [
             'id', 'config_type', 'config_version', 'config_data',
-            'effective_from', 'effective_to', 'is_active', 'created_at'
+            'effective_from', 'effective_to', 'is_active',
+            'fetched_from_mra_at', 'created_at'
         ]
-        read_only_fields = ['id', 'created_at']
-
-
-class MRAProductMappingSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = MRAProductMapping
-        fields = [
-            'id', 'inventory_item_id', 'product_name',
-            'mra_product_code', 'mra_product_name', 'tax_category',
-            'approved_price', 'tax_rate',
-            'is_approved', 'is_active', 'approved_at', 'created_at'
-        ]
-        read_only_fields = ['id', 'approved_at', 'created_at']
-
-
-class MRAProductMappingCreateSerializer(serializers.Serializer):
-    """Serializer for creating product mappings"""
-    inventory_item_id = serializers.CharField(max_length=255)
-    product_name = serializers.CharField(max_length=255)
-    mra_product_code = serializers.CharField(max_length=50)
-    mra_product_name = serializers.CharField(max_length=255)
-    tax_category = serializers.ChoiceField(choices=['standard', 'zero', 'exempt'])
-    approved_price = serializers.DecimalField(max_digits=12, decimal_places=2)
-    tax_rate = serializers.DecimalField(max_digits=5, decimal_places=2)
+        read_only_fields = ['id', 'fetched_from_mra_at', 'created_at']
 
 
 class InvoiceItemSerializer(serializers.Serializer):
@@ -198,14 +215,27 @@ class MRAAPIErrorSerializer(serializers.ModelSerializer):
 
 class TerminalStatusSerializer(serializers.Serializer):
     """Serializer for terminal status response"""
+    id = serializers.CharField(required=False)
+    business = serializers.CharField(required=False, allow_blank=True)
+    branch = serializers.CharField(required=False, allow_blank=True)
     terminal_id = serializers.CharField()
+    mra_terminal_id = serializers.CharField(required=False, allow_blank=True)
+    device_serial = serializers.CharField(required=False, allow_blank=True)
+    mac_address = serializers.CharField(required=False, allow_blank=True)
+    pos_name = serializers.CharField(required=False, allow_blank=True)
+    pos_version = serializers.CharField(required=False, allow_blank=True)
+    os_type = serializers.CharField(required=False, allow_blank=True)
     status = serializers.CharField()
     is_online = serializers.BooleanField()
+    has_mra_token = serializers.BooleanField(required=False)
     online_invoice_counter = serializers.IntegerField()
     offline_invoice_counter = serializers.IntegerField()
     pending_offline_invoices = serializers.IntegerField()
+    activated_at = serializers.DateTimeField(required=False, allow_null=True)
     token_expires_at = serializers.DateTimeField(allow_null=True)
     last_sync_at = serializers.DateTimeField(allow_null=True)
+    blocking_status = serializers.JSONField(required=False, allow_null=True)
+    health_check = serializers.JSONField(required=False, allow_null=True)
 
 
 class SyncStatusSerializer(serializers.Serializer):
