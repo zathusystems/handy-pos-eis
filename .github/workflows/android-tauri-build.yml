@@ -58,7 +58,11 @@ jobs:
             i686-linux-android
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        # v3 requests the removed legacy `tools` package. v4 uses modern
+        # command-line tools and lets us install only the packages we need.
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
 
       - name: Install Android SDK/NDK packages
         run: |
