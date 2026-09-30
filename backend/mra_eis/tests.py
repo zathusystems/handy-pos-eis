@@ -1276,6 +1276,11 @@ class TerminalBlockingComplianceTests(TransactionTestCase):
             is_online=True,
         )
         self._create_fresh_configurations()
+        TerminalService.record_server_time_sync(
+            self.terminal,
+            server_time=timezone.now(),
+            source='test_fixture',
+        )
 
     def _create_fresh_configurations(self):
         now = timezone.now()
@@ -1537,6 +1542,7 @@ class TerminalBlockingComplianceTests(TransactionTestCase):
         MRA_EIS_DRY_RUN=False,
         MRA_EIS_ENABLE_HTTP_CALLS=True,
         MRA_EIS_ALLOW_LIVE_SUBMISSION=True,
+        MRA_EIS_REQUIRE_REMOTE_SEQUENCE_RECOVERY_FOR_SALES=True,
     )
     @patch.object(MRAEISClient, 'call')
     def test_sale_uses_cached_terminal_state_when_block_check_network_fails(self, mock_call):
@@ -2600,6 +2606,7 @@ class CorrectionServiceContractTests(TestCase):
             address='123 Main St',
             city='Lilongwe',
             country='Malawi',
+            mra_site_id='SITE-CORR-001',
         )
         BusinessSettings.objects.create(
             business=self.business,

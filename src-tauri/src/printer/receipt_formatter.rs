@@ -62,6 +62,19 @@ pub fn html_to_escpos(html: &str, line_width: usize, horizontal_offset: usize) -
         let trimmed = line.trim();
         let lower = trimmed.to_ascii_lowercase();
 
+        // The receipt UI no longer prints a scan-instruction line. Keep the
+        // QR before the fiscal legal-end marker so the output order remains
+        // QR -> legal footer when the instruction is omitted.
+        if !has_qr
+            && qr_payload.is_some()
+            && is_legal_receipt_end_marker(trimmed)
+        {
+            if let Some(payload) = qr_payload.as_deref() {
+                append_qr_code(&mut data, payload, horizontal_offset, line_width);
+                has_qr = true;
+            }
+        }
+
         if allow_company_name_detection
             && (lower.starts_with("order #:")
                 || lower.starts_with("date:")
@@ -81,7 +94,12 @@ pub fn html_to_escpos(html: &str, line_width: usize, horizontal_offset: usize) -
             continue;
         }
 
-        let printable_line = if horizontal_offset > 0 && !line.trim().is_empty() {
+        let should_center_current_line = uses_explicit_thermal_layout
+            && !trimmed.is_empty()
+            && should_center_explicit_thermal_line(trimmed);
+        let printable_line = if should_center_current_line {
+            trimmed.to_string()
+        } else if horizontal_offset > 0 && !line.trim().is_empty() {
             format!("{}{}", " ".repeat(horizontal_offset), line)
         } else {
             line.to_string()
@@ -98,7 +116,15 @@ pub fn html_to_escpos(html: &str, line_width: usize, horizontal_offset: usize) -
         if bold_current_line {
             append_bold_mode(&mut data, line_width, true);
         }
+        if should_center_current_line {
+            // Apply alignment after font-mode commands: some ESC/POS clones
+            // reset alignment when ESC ! / ESC E is changed.
+            data.extend_from_slice(b"\x1B\x61\x01"); // center alignment
+        }
         data.extend_from_slice(printable_line.as_bytes());
+        if should_center_current_line {
+            data.extend_from_slice(b"\x1B\x61\x00"); // left alignment
+        }
         if bold_current_line {
             append_bold_mode(&mut data, line_width, false);
         }
@@ -219,6 +245,11 @@ fn is_legal_receipt_marker(line: &str) -> bool {
         || lower.starts_with("*** end of receipt")
 }
 
+fn is_legal_receipt_end_marker(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    lower.starts_with("*** end of legal receipt") || lower.starts_with("*** end of receipt")
+}
+
 fn is_vat_registration_marker(line: &str) -> bool {
     let normalized = line.trim().trim_matches('*').trim().to_ascii_lowercase();
 
@@ -227,6 +258,18 @@ fn is_vat_registration_marker(line: &str) -> bool {
 
 fn is_total_line(line: &str) -> bool {
     line.trim().to_ascii_lowercase().starts_with("total:")
+}
+
+fn should_center_explicit_thermal_line(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+
+    is_legal_receipt_marker(line)
+        || is_copy_marker_line(line)
+        || is_vat_registration_marker(line)
+        || (lower.starts_with("date:") && lower.contains("time:"))
+        || lower.starts_with("scan here for receipt details")
+        || lower.starts_with("qr pending")
+        || lower.starts_with("thank you")
 }
 
 fn truncate_with_suffix(value: &str, max_chars: usize) -> String {
@@ -270,9 +313,9 @@ fn append_company_name_banner(data: &mut Vec<u8>, name: &str, line_width: usize)
 }
 
 fn append_feed_and_cut(data: &mut Vec<u8>, has_qr: bool) {
-    // Feed enough paper for the legal footer to clear the cutter. Some thermal
-    // printers cut very close to the last rendered line, especially after QR.
-    let feed_lines: u8 = if has_qr { 7 } else { 5 };
+    // Keep the cut clearance short so the printer does not add a long blank
+    // tail after the receipt. QR output gets one extra line for cutter safety.
+    let feed_lines: u8 = if has_qr { 3 } else { 2 };
     data.extend_from_slice(&[0x1B, 0x64, feed_lines]); // Print buffer and feed n lines
     data.extend_from_slice(b"\x1D\x56\x00"); // Full cut
 }
@@ -975,14 +1018,13 @@ fn append_qr_code(data: &mut Vec<u8>, payload: &str, horizontal_offset: usize, l
         bytes
     };
 
-    data.extend_from_slice(b"\n");
     data.extend_from_slice(b"\x1D\x4C\x00\x00"); // reset left margin before centered QR
     data.extend_from_slice(b"\x1B\x61\x01"); // center align
     data.extend_from_slice(&[0x1D, 0x28, 0x6B, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00]); // model 2
     let qr_module_size: u8 = if line_width <= COMPACT_RECEIPT_LINE_WIDTH {
-        0x04
+        0x03
     } else {
-        0x05
+        0x04
     };
     data.extend_from_slice(&[0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x43, qr_module_size]); // size
     data.extend_from_slice(&[0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x45, 0x31]); // error correction: M
@@ -1105,9 +1147,25 @@ mod tests {
     }
 
     #[test]
+    fn prints_qr_before_legal_receipt_end_without_scan_instruction() {
+        let payload = "https://example.test/receipt/short";
+        let thermal = "DATE: 2026-05-23 TIME: 12:33:37\n*** END OF LEGAL RECEIPT ***";
+        let encoded = urlencoding::encode(&thermal);
+        let html = format!(
+            r#"<div id="receipt-printable-area" data-thermal-receipt-text="{encoded}" data-eis-qr-payload="{payload}"></div>"#
+        );
+        let bytes = html_to_escpos(&html, DEFAULT_RECEIPT_LINE_WIDTH, 0);
+        let rendered = String::from_utf8_lossy(&bytes);
+
+        let payload_index = rendered.find(payload).unwrap();
+        let end_index = rendered.find("*** END OF LEGAL RECEIPT ***").unwrap();
+        assert!(payload_index < end_index);
+    }
+
+    #[test]
     fn thermal_receipt_text_attribute_overrides_css_html_layout() {
         let thermal = "*** START OF LEGAL RECEIPT ***\n1 X 19350.00                 19350.00 A\nCOKE 01X20 300 R...\nTOTAL:                       19350.00\nScan Here For Receipt Details\n*** END OF LEGAL RECEIPT ***";
-        let encoded = urlencoding::encode(thermal);
+        let encoded = urlencoding::encode(&thermal);
         let html = format!(
             r#"<div id="receipt-printable-area" data-thermal-receipt-text="{encoded}" data-eis-qr-payload="https://example.test/qr"><div style="display:flex"><span>broken css</span><span>layout</span></div></div>"#
         );
@@ -1122,7 +1180,7 @@ mod tests {
     #[test]
     fn explicit_thermal_receipt_bolds_vat_status_and_total() {
         let thermal = "*** START OF LEGAL RECEIPT ***\nHANDYPOS\nTIN: 70267581\n*VAT REGISTERED*\nTOTAL:                       19350.00\n*** END OF LEGAL RECEIPT ***";
-        let encoded = urlencoding::encode(thermal);
+        let encoded = urlencoding::encode(&thermal);
         let html = format!(
             r#"<div id="receipt-printable-area" data-thermal-receipt-text="{encoded}"></div>"#
         );
@@ -1140,39 +1198,59 @@ mod tests {
     }
 
     #[test]
-    fn explicit_thermal_receipt_preserves_centered_legal_and_vat_padding() {
+    fn explicit_thermal_receipt_centers_legal_and_vat_markers() {
         let start = center_text("*** START OF LEGAL RECEIPT ***", DEFAULT_RECEIPT_LINE_WIDTH);
         let vat = center_text("*VAT REGISTERED*", DEFAULT_RECEIPT_LINE_WIDTH);
         let end = center_text("*** END OF LEGAL RECEIPT ***", DEFAULT_RECEIPT_LINE_WIDTH);
         let thermal = format!("{start}\n{vat}\nTOTAL:                       19350.00\n{end}");
-        let encoded = urlencoding::encode(thermal);
+        let encoded = urlencoding::encode(&thermal);
         let html = format!(
             r#"<div id="receipt-printable-area" data-thermal-receipt-text="{encoded}"></div>"#
         );
         let bytes = html_to_escpos(&html, DEFAULT_RECEIPT_LINE_WIDTH, 0);
         let rendered = String::from_utf8_lossy(&bytes);
 
-        assert!(rendered.contains(&format!("{start}\n")));
-        assert!(rendered.contains(&format!("{vat}\n")));
-        assert!(rendered.contains(&format!("{end}\n")));
+        for marker in [
+            "*** START OF LEGAL RECEIPT ***",
+            "*VAT REGISTERED*",
+            "*** END OF LEGAL RECEIPT ***",
+        ] {
+            let marker_index = rendered
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing marker: {marker}"));
+            let center_index = rendered[..marker_index]
+                .rfind("\x1B\x61\x01")
+                .unwrap_or_else(|| panic!("marker was not centered: {marker}"));
+            assert!(center_index < marker_index);
+        }
     }
 
     #[test]
-    fn explicit_thermal_receipt_preserves_centered_markers_for_58mm_width() {
+    fn explicit_thermal_receipt_centers_markers_for_58mm_width() {
         let start = center_text("*** START OF LEGAL RECEIPT ***", COMPACT_RECEIPT_LINE_WIDTH);
         let vat = center_text("*NON VAT REGISTERED*", COMPACT_RECEIPT_LINE_WIDTH);
         let end = center_text("*** END OF LEGAL RECEIPT ***", COMPACT_RECEIPT_LINE_WIDTH);
         let thermal = format!("{start}\n{vat}\nTOTAL:             19350.00\n{end}");
-        let encoded = urlencoding::encode(thermal);
+        let encoded = urlencoding::encode(&thermal);
         let html = format!(
             r#"<div id="receipt-printable-area" data-thermal-receipt-text="{encoded}"></div>"#
         );
         let bytes = html_to_escpos(&html, COMPACT_RECEIPT_LINE_WIDTH, 0);
         let rendered = String::from_utf8_lossy(&bytes);
 
-        assert!(rendered.contains(&format!("{start}\n")));
-        assert!(rendered.contains(&format!("{vat}\n")));
-        assert!(rendered.contains(&format!("{end}\n")));
+        for marker in [
+            "*** START OF LEGAL RECEIPT ***",
+            "*NON VAT REGISTERED*",
+            "*** END OF LEGAL RECEIPT ***",
+        ] {
+            let marker_index = rendered
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing marker: {marker}"));
+            let center_index = rendered[..marker_index]
+                .rfind("\x1B\x61\x01")
+                .unwrap_or_else(|| panic!("marker was not centered: {marker}"));
+            assert!(center_index < marker_index);
+        }
     }
 
     #[test]
@@ -1190,7 +1268,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_thermal_receipt_preserves_centered_copy_marker_padding() {
+    fn explicit_thermal_receipt_centers_copy_marker() {
         let thermal = "                   COPY\nBuyers Name:              Walk-in Customer";
         let encoded = urlencoding::encode(thermal);
         let html = format!(
@@ -1199,7 +1277,11 @@ mod tests {
         let bytes = html_to_escpos(&html, DEFAULT_RECEIPT_LINE_WIDTH, 0);
         let rendered = String::from_utf8_lossy(&bytes);
 
-        assert!(rendered.contains("                   COPY\n"));
+        let copy_index = rendered.find("COPY").expect("missing copy marker");
+        let center_index = rendered[..copy_index]
+            .rfind("\x1B\x61\x01")
+            .expect("copy marker was not centered");
+        assert!(center_index < copy_index);
         assert!(rendered.contains("Buyers Name:              Walk-in Customer"));
     }
 }

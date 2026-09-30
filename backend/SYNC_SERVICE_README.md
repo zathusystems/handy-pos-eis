@@ -142,3 +142,153 @@ All system operations sync through this one centralized service:
 ✅ Logging
 
 Done!
+
+
+
+
+Bless Jasi
+jasibless@gmail.com
+Handy pos receipts
+handyposreceipts@gmail.com
+brown mwase
+brownmwase265@gmail.com
+
+
+Fyness
+fyness265mw@gmail.com
+Signed out
+Ethan Malembo
+ethan265mw@gmail.com
+Signed out
+Ibrahim
+ibrahim22mw@gmail.com
+Signed out
+Lindazathu
+lindazathu265@gmail.com
+Hanneck Malembo
+zathusystems@gmail.com
+Signed out
+hanneck malembo
+mudzimw@gmail.com
+Signed out
+Hanneck Malembo
+malembohanneck@gmail.com
+Signed out
+Josh
+joshmw265@gmail.com
+Shawn
+shawn265mw@gmail.com
+Snowden
+snowden265mw@gmail.com
+Tspoon265
+tspoon265mw@gmail.com
+Chims
+chims265mw@gmail.com
+Trizamw
+trizamw265@gmail.com
+gusto265mw@gmail.com
+Justice
+justice265mw@gmail.com
+
+
+
+
+Malita Gunde
+malitagunde265@gmail.com
+
+Bamusi Gunde
+bamusigunde@gmail.com
+
+Janta Stanley
+jantastanley@gmail.com
+
+Sophia Bwanali
+sophiabwanali265@gmail.com
+
+Edith Changalume
+edithchangalume@gmail.com
+
+Justine Chiletso
+justinechiletso@gmail.com
+
+Judi Gangata
+judigangata@gmail.com
+
+Shante Sikelo
+shantesikelo@gmail.com
+
+Brown Sikero
+brownsikero@gmail.com
+
+Snowden
+snowden265mw@gmail.com
+
+
+
+Malita Gunde
+malitagunde265@gmail.com
+Signed out
+
+Bamusi Gunde
+bamusigunde@gmail.com
+Signed out
+
+Janta Stanley
+jantastanley@gmail.com
+Signed out
+
+Sophia Bwanali
+sophiabwanali265@gmail.com
+Signed out
+
+Edith Changalume
+edithchangalume@gmail.com
+Signed out
+
+Justine Chiletso
+justinechiletso@gmail.com
+Signed out
+
+Judi Gangata
+judigangata@gmail.com
+Signed out
+
+Shante Sikelo
+shantesikelo@gmail.com
+Signed out
+
+Brown Sikero
+brownsikero@gmail.com
+Signed out
+
+Snowden
+snowden265mw@gmail.com
+Signed out
+
+Joanna Sikelo
+joannasikelo@gmail.com
+
+dytonmalewa@gmail.com
+
+marinsokali@gmail.com
+
+Jabesi Stonken
+jabesistonken@gmail.com
+
+Hanneck Malembo
+malembohanneck@gmail.com
+
+Hanneck Malembo
+zathusystems@gmail.com
+
+Jabesi Stonken
+jabesistonken265@gmail.com
+
+Mwiza Spokes
+mwizaspokes@gmail.com
+
+Foluku Ginimbi
+folukuginimbi@gmail.com
+
+Dex Sumula
+dexsumula@gmail.com

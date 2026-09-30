@@ -390,7 +390,7 @@ class SilentPrintService {
                   padding: 0;
                 }
                 @media print {
-                  * {
+                  body {
                     margin: 0 !important;
                     padding: 0 !important;
                   }
@@ -480,7 +480,7 @@ class SilentPrintService {
                   padding: 0;
                 }
                 @media print {
-                  * {
+                  body {
                     margin: 0 !important;
                     padding: 0 !important;
                   }

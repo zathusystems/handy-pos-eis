@@ -289,8 +289,6 @@ export const Receipt = ({
   const resolvedBusiness = business || offlineBusiness || undefined;
   const businessName = resolvedBusiness?.name?.trim() || 'Business Name';
   const businessNameDisplay = businessName.toUpperCase();
-  const compactBusinessName = businessNameDisplay.replace(/\s+/g, ' ').trim();
-  const businessNameLength = compactBusinessName.length;
   const businessAddress = resolvedBusiness?.address?.trim();
   const businessPhone = resolvedBusiness?.phone?.trim();
   const businessEmail = resolvedBusiness?.email?.trim();
@@ -571,105 +569,121 @@ export const Receipt = ({
   const receiptVatTotal = hasPerItemTax ? totalItemVat : normalizedOrderTax;
   const resolvedPaperWidth = normalizePrinterPaperWidth(paperWidth);
   const receiptLayout: Record<PrinterPaperWidth, {
-    containerWidthClass: string;
-    contentPaddingClass: string;
-    bodyTextClass: string;
-    metaTextClass: string;
-    businessNameTextClass: string;
-    longBusinessNameTextClass: string;
-    payableTextClass: string;
-    inlineValueMaxWidthClass: string;
+    contentPadding: string;
     fontSizePx: number;
+    bodyFontSizePx: number;
+    metaFontSizePx: number;
+    businessNameFontSizePx: number;
+    lineHeight: number;
+    sectionGap: string;
+    rowGap: string;
+    itemGap: string;
+    ruleGap: string;
     qrSize: string;
     qrMinHeight: string;
+    qrPadding: string;
     lineWidth: number;
     compactTextMax: number;
+    compactLabels: boolean;
+    labelColumnPercent: number;
   }> = {
     '30mm': {
-      containerWidthClass: 'w-[112px]',
-      contentPaddingClass: 'px-1 py-2',
-      bodyTextClass: 'text-[7px]',
-      metaTextClass: 'text-[6px]',
-      businessNameTextClass: 'text-[7px]',
-      longBusinessNameTextClass: 'text-[7px] tracking-normal',
-      payableTextClass: 'text-[9px]',
-      inlineValueMaxWidthClass: 'min-w-0 max-w-[52px]',
-      fontSizePx: 6,
-      qrSize: '18mm',
-      qrMinHeight: '20mm',
+      contentPadding: '2mm 1.5mm',
+      fontSizePx: 5.5,
+      bodyFontSizePx: 6.5,
+      metaFontSizePx: 5.5,
+      businessNameFontSizePx: 6.5,
+      lineHeight: 1.3,
+      sectionGap: '2.5mm',
+      rowGap: '0.7mm',
+      itemGap: '1.6mm',
+      ruleGap: '1.4mm',
+      qrSize: '14mm',
+      qrMinHeight: '14mm',
+      qrPadding: '0.25mm 0.5mm',
       lineWidth: 16,
       compactTextMax: 12,
+      compactLabels: true,
+      labelColumnPercent: 34,
     },
     '40mm': {
-      containerWidthClass: 'w-[150px]',
-      contentPaddingClass: 'px-1.5 py-2',
-      bodyTextClass: 'text-[8px]',
-      metaTextClass: 'text-[7px]',
-      businessNameTextClass: 'text-[8px]',
-      longBusinessNameTextClass: 'text-[8px] tracking-normal',
-      payableTextClass: 'text-[10px]',
-      inlineValueMaxWidthClass: 'min-w-0 max-w-[72px]',
-      fontSizePx: 7,
-      qrSize: '20mm',
-      qrMinHeight: '22mm',
+      contentPadding: '2mm 1.5mm',
+      fontSizePx: 6.5,
+      bodyFontSizePx: 7.5,
+      metaFontSizePx: 6.5,
+      businessNameFontSizePx: 7.5,
+      lineHeight: 1.3,
+      sectionGap: '2.5mm',
+      rowGap: '0.7mm',
+      itemGap: '1.7mm',
+      ruleGap: '1.4mm',
+      qrSize: '16mm',
+      qrMinHeight: '16mm',
+      qrPadding: '0.25mm 0.5mm',
       lineWidth: 21,
       compactTextMax: 16,
+      compactLabels: true,
+      labelColumnPercent: 36,
     },
     '50mm': {
-      containerWidthClass: 'w-[188px]',
-      contentPaddingClass: 'px-2 py-2',
-      bodyTextClass: 'text-[8px]',
-      metaTextClass: 'text-[7px]',
-      businessNameTextClass: 'text-[8px]',
-      longBusinessNameTextClass: 'text-[8px] tracking-normal',
-      payableTextClass: 'text-[10px]',
-      inlineValueMaxWidthClass: 'min-w-0 max-w-[92px]',
-      fontSizePx: 8,
-      qrSize: '22mm',
-      qrMinHeight: '24mm',
+      contentPadding: '2.5mm 2mm',
+      fontSizePx: 7.5,
+      bodyFontSizePx: 7.5,
+      metaFontSizePx: 6.5,
+      businessNameFontSizePx: 7.5,
+      lineHeight: 1.3,
+      sectionGap: '2.75mm',
+      rowGap: '0.75mm',
+      itemGap: '1.8mm',
+      ruleGap: '1.5mm',
+      qrSize: '18mm',
+      qrMinHeight: '18mm',
+      qrPadding: '0.25mm 0.5mm',
       lineWidth: 25,
       compactTextMax: 20,
+      compactLabels: true,
+      labelColumnPercent: 38,
     },
     '58mm': {
-      containerWidthClass: 'w-[218px]',
-      contentPaddingClass: 'px-2 py-2',
-      bodyTextClass: 'text-[9.5px]',
-      metaTextClass: 'text-[8.5px]',
-      businessNameTextClass: 'text-[9.5px]',
-      longBusinessNameTextClass: 'text-[9.5px] tracking-normal',
-      payableTextClass: 'text-[13px]',
-      inlineValueMaxWidthClass: 'min-w-0 max-w-[108px]',
-      fontSizePx: 9.5,
-      qrSize: '24mm',
-      qrMinHeight: '26mm',
+      contentPadding: '2.5mm 2.25mm',
+      fontSizePx: 8.5,
+      bodyFontSizePx: 8.5,
+      metaFontSizePx: 7.5,
+      businessNameFontSizePx: 8.5,
+      lineHeight: 1.28,
+      sectionGap: '2.5mm',
+      rowGap: '0.65mm',
+      itemGap: '1.7mm',
+      ruleGap: '1.3mm',
+      qrSize: '18mm',
+      qrMinHeight: '18mm',
+      qrPadding: '0.25mm 0.5mm',
       lineWidth: 32,
-      compactTextMax: 14,
+      compactTextMax: 16,
+      compactLabels: true,
+      labelColumnPercent: 38,
     },
     '80mm': {
-      containerWidthClass: 'w-[300px]',
-      contentPaddingClass: 'px-3 py-2',
-      bodyTextClass: 'text-[10px]',
-      metaTextClass: 'text-[9px]',
-      businessNameTextClass: 'text-[10px]',
-      longBusinessNameTextClass: 'text-[10px] tracking-normal',
-      payableTextClass: 'text-sm',
-      inlineValueMaxWidthClass: 'min-w-0 max-w-[170px]',
+      contentPadding: '3mm 3mm',
       fontSizePx: 10,
-      qrSize: '28mm',
-      qrMinHeight: '30mm',
+      bodyFontSizePx: 10,
+      metaFontSizePx: 9,
+      businessNameFontSizePx: 10,
+      lineHeight: 1.38,
+      sectionGap: '3.5mm',
+      rowGap: '0.9mm',
+      itemGap: '2.2mm',
+      ruleGap: '1.7mm',
+      qrSize: '24mm',
+      qrMinHeight: '24mm',
+      qrPadding: '1mm',
       lineWidth: 42,
       compactTextMax: 30,
+      compactLabels: false,
+      labelColumnPercent: 46,
     },
   };
   const layout = receiptLayout[resolvedPaperWidth];
-  const containerWidthClass = layout.containerWidthClass;
-  const contentPaddingClass = layout.contentPaddingClass;
-  const bodyTextClass = layout.bodyTextClass;
-  const metaTextClass = layout.metaTextClass;
-  const businessNameTextClass = layout.businessNameTextClass;
-  const businessNameWidthClass = businessNameLength > 30 ? layout.longBusinessNameTextClass : '';
-  const payableTextClass = layout.payableTextClass;
-  const inlineValueMaxWidthClass = layout.inlineValueMaxWidthClass;
   const qrSizeStyle = {
     width: layout.qrSize,
     height: layout.qrSize,
@@ -681,31 +695,28 @@ export const Receipt = ({
   // Keep divider width aligned with native ESC/POS formatter widths
   // to prevent hard-wrap in printed output.
   const receiptLineWidth = layout.lineWidth;
-  const sectionDotRule = '-'.repeat(receiptLineWidth);
-  const sectionSpacingClass = 'mt-3 mb-3';
-  const makeSectionBanner = (title: string): string => {
-    return title.trim().toUpperCase();
-  };
-  const renderDotRuleLine = () => (
-    <p
-      className={`block w-full overflow-hidden whitespace-nowrap text-center ${metaTextClass} leading-none`}
-      style={{ overflowWrap: 'normal', wordBreak: 'normal' }}
-    >
-      {sectionDotRule}
-    </p>
-  );
-  const renderSectionDivider = () => (
-    <div className="mb-1">
-      {renderDotRuleLine()}
-    </div>
-  );
-  const renderSectionTitleBlock = (title: string) => (
-    <div className="mb-1 space-y-0.5">
-      {renderDotRuleLine()}
-      <p className={`text-center ${metaTextClass} font-semibold tracking-wide`}>{makeSectionBanner(title)}</p>
-      {renderDotRuleLine()}
-    </div>
-  );
+  // Narrow rolls need more room for values than long descriptive labels.
+  // These abbreviations are intentionally limited to the compact profiles;
+  // the 80mm layout keeps the full labels for maximum clarity.
+  const receiptLabels = layout.compactLabels
+    ? {
+        buyer: 'Buyer:',
+        buyerTin: 'TIN:',
+        receiptNumber: 'Receipt #:',
+        posReference: 'Ref:',
+        receiptStatus: 'Status:',
+        amountTendered: 'Tendered:',
+        payment: 'Pay:',
+      }
+    : {
+        buyer: 'Buyers Name:',
+        buyerTin: 'Buyers Tin:',
+        receiptNumber: 'Receipt Number:',
+        posReference: 'POS Ref:',
+        receiptStatus: 'Receipt Status:',
+        amountTendered: 'Amount Tendered:',
+        payment: 'Payment:',
+      };
 
   const isCopyReceipt = copyNumber > 1;
   const receiptTypeLabel = `COPY${copyNumber > 2 ? ` #${copyNumber}` : ''}`;
@@ -784,6 +795,9 @@ export const Receipt = ({
   );
   const legalReceiptTitle = isFiscalizedReceipt ? '*** START OF LEGAL RECEIPT ***' : '*** START OF RECEIPT ***';
   const legalReceiptEndTitle = isFiscalizedReceipt ? '*** END OF LEGAL RECEIPT ***' : '*** END OF RECEIPT ***';
+  // Keep tax-system legal markers on fiscalized receipts. Non-fiscal receipts
+  // omit the decorative markers to avoid adding unnecessary roll length.
+  const showReceiptMarkers = isFiscalizedReceipt;
   const legalTaxBreakdown = taxBreakdown.map((tax) => {
     const code = resolveTaxCode(tax.rate);
     return {
@@ -866,8 +880,41 @@ export const Receipt = ({
   const thermalLine = (text = '') => text.replace(/\s+/g, ' ').trim();
   const centerThermal = (text: string) => {
     const value = thermalLine(text);
-    if (value.length >= receiptLineWidth) return value;
-    return `${' '.repeat(Math.floor((receiptLineWidth - value.length) / 2))}${value}`;
+    if (!value) return '';
+
+    const chunks: string[] = [];
+    let current = '';
+    const pushCurrent = () => {
+      if (current) {
+        chunks.push(current);
+        current = '';
+      }
+    };
+
+    for (const word of value.split(' ')) {
+      if (!word) continue;
+
+      if (word.length > receiptLineWidth) {
+        pushCurrent();
+        for (let offset = 0; offset < word.length; offset += receiptLineWidth) {
+          chunks.push(word.slice(offset, offset + receiptLineWidth));
+        }
+        continue;
+      }
+
+      const candidate = current ? `${current} ${word}` : word;
+      if (candidate.length > receiptLineWidth) {
+        pushCurrent();
+      }
+      current = current ? `${current} ${word}` : word;
+    }
+    pushCurrent();
+
+    return chunks
+      .map((line) => line.length >= receiptLineWidth
+        ? line
+        : `${' '.repeat(Math.floor((receiptLineWidth - line.length) / 2))}${line}`)
+      .join('\n');
   };
   const alignThermal = (left: string, right: string) => {
     const cleanLeft = thermalLine(left);
@@ -886,10 +933,10 @@ export const Receipt = ({
   const thermalAmount = (value: unknown) => formatReceiptAmount(value);
   const thermalTextLines: string[] = [];
   if (effectiveShowHeader) {
-    thermalTextLines.push(
-      centerThermal(legalReceiptTitle),
-      centerThermal(businessNameDisplay)
-    );
+    if (showReceiptMarkers) {
+      thermalTextLines.push(centerThermal(legalReceiptTitle));
+    }
+    thermalTextLines.push(centerThermal(businessNameDisplay));
     if (sellerAddressLines.length > 0) {
       sellerAddressLines.forEach((line) => thermalTextLines.push(centerThermal(line.toUpperCase())));
     } else {
@@ -907,10 +954,10 @@ export const Receipt = ({
     thermalTextLines.push('');
   }
   thermalTextLines.push(
-    alignThermal('Buyers Name:', buyerName),
-    alignThermal('Buyers Tin:', buyerTin),
-    alignThermal('Receipt Number:', receiptNumberDisplay),
-    alignThermal('POS Ref:', posReferenceDisplay),
+    alignThermal(receiptLabels.buyer, buyerName || 'Walk-in Customer'),
+    alignThermal(receiptLabels.buyerTin, buyerTin || 'N/A'),
+    alignThermal(receiptLabels.receiptNumber, receiptNumberDisplay),
+    alignThermal(receiptLabels.posReference, posReferenceDisplay),
     legalRule
   );
   if (effectiveShowItemDetails) {
@@ -926,7 +973,7 @@ export const Receipt = ({
       const itemDiscountName = String(item.discount_name ?? item.discountName ?? 'Discount').trim() || 'Discount';
       thermalTextLines.push(
         alignThermal(`${formatReceiptQuantity(itemQuantity)} X ${thermalAmount(itemPrice)}`, `${thermalAmount(itemTotal)} ${itemTaxCode}`),
-        compactReceiptText(item.name, 14)
+        compactReceiptText(item.name)
       );
       if (itemDiscount > 0) {
         thermalTextLines.push(alignThermal(compactReceiptText(itemDiscountName, Math.max(8, receiptLineWidth - 14)), `-${thermalAmount(itemDiscount)}`));
@@ -953,29 +1000,32 @@ export const Receipt = ({
   }
   thermalTextLines.push(
     alignThermal('TOTAL:', thermalAmount(normalizedFinalPayable)),
-    alignThermal('Amount Tendered:', thermalAmount(tenderedAmount)),
+    alignThermal(receiptLabels.amountTendered, thermalAmount(tenderedAmount)),
     alignThermal('Change:', thermalAmount(receiptChangeDisplay))
   );
   if (paymentMethodDisplay) {
-    thermalTextLines.push(alignThermal('Payment:', paymentMethodDisplay));
+    thermalTextLines.push(alignThermal(receiptLabels.payment, paymentMethodDisplay));
   }
   thermalTextLines.push(
     '',
     centerThermal(`DATE: ${format(orderDate, 'yyyy-MM-dd')} TIME: ${format(orderDate, 'HH:mm:ss')}`)
   );
-  if (hasEisVerificationData) {
-    thermalTextLines.push(centerThermal('Scan Here For Receipt Details'));
-  }
-  if (!shouldRenderQr && hasEisVerificationData) {
-    thermalTextLines.push(centerThermal('QR PENDING'));
-  }
-  if (effectiveShowFooter) {
-    thermalTextLines.push('', centerThermal(legalReceiptEndTitle), legalRule, centerThermal('THANK YOU!'));
+  if (effectiveShowFooter && showReceiptMarkers) {
+    thermalTextLines.push('', centerThermal(legalReceiptEndTitle), legalRule);
   }
   const thermalReceiptText = thermalTextLines.join('\n').replace(/\n{3,}/g, '\n\n');
-  const receiptRootClass = `${containerWidthClass} ${contentPaddingClass} bg-white text-black font-mono ${bodyTextClass} leading-tight`;
+  const receiptRootClass = 'receipt-root bg-white text-black font-mono';
   const receiptRootStyle: React.CSSProperties = {
+    width: printContentWidth,
+    maxWidth: '100%',
+    margin: '0 auto',
+    padding: layout.contentPadding,
+    boxSizing: 'border-box',
+    fontFamily: "'Courier New', Courier, monospace",
     fontSize: `${layout.fontSizePx}px`,
+    lineHeight: layout.lineHeight,
+    color: '#000',
+    backgroundColor: '#fff',
   };
 
   return (
@@ -989,33 +1039,168 @@ export const Receipt = ({
     >
       <style jsx global>{`
         #${elementId},
-        #${elementId} * {
+        #${elementId} *,
+        #${elementId} *::before,
+        #${elementId} *::after {
+          box-sizing: border-box;
           overflow-wrap: anywhere;
           word-break: break-word;
           letter-spacing: 0;
         }
+
+        #${elementId} {
+          width: ${printContentWidth};
+          max-width: 100%;
+          margin: 0 auto;
+          padding: ${layout.contentPadding};
+          font-family: 'Courier New', Courier, monospace;
+          font-size: ${layout.fontSizePx}px;
+          line-height: ${layout.lineHeight};
+          color: #000;
+          background: #fff;
+          text-align: left;
+        }
+        #${elementId} p {
+          margin: 0;
+        }
+        #${elementId} .receipt-center,
         #${elementId} .receipt-legal-marker,
         #${elementId} .receipt-vat-status {
           display: block;
           width: 100%;
+          margin-left: auto;
+          margin-right: auto;
           text-align: center !important;
-          font-weight: 700 !important;
         }
-        #${elementId} .receipt-total-row,
+        #${elementId} .receipt-vat-status {
+          white-space: normal;
+        }
+        #${elementId} .receipt-header {
+          margin: 0 0 ${layout.sectionGap};
+          text-align: center;
+        }
+        #${elementId} .receipt-legal-marker {
+          display: block;
+          width: 100%;
+          max-width: 100%;
+          margin-bottom: ${layout.rowGap};
+          font-size: ${layout.bodyFontSizePx}px;
+          line-height: 1.25;
+          font-weight: 700;
+          white-space: normal;
+        }
+        #${elementId} .receipt-business-name {
+          margin-bottom: ${layout.rowGap};
+          font-size: ${layout.businessNameFontSizePx}px;
+          line-height: 1.25;
+          font-weight: 700;
+          text-align: center;
+        }
+        #${elementId} .receipt-meta {
+          font-size: ${layout.metaFontSizePx}px;
+          line-height: 1.35;
+          text-align: center;
+        }
+        #${elementId} .receipt-body {
+          font-size: ${layout.bodyFontSizePx}px;
+          line-height: ${layout.lineHeight};
+        }
+        #${elementId} .receipt-copy-marker {
+          margin-top: ${layout.rowGap};
+          font-size: ${layout.bodyFontSizePx}px;
+          font-weight: 700;
+          text-align: center;
+        }
+        #${elementId} .receipt-order-meta {
+          display: flex;
+          flex-direction: column;
+          gap: ${layout.rowGap};
+          margin-top: ${layout.sectionGap};
+        }
+        #${elementId} .receipt-label-row,
+        #${elementId} .receipt-value-row {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          align-items: baseline;
+          column-gap: 2mm;
+          min-width: 0;
+        }
+        #${elementId} .receipt-label-row {
+          grid-template-columns: minmax(0, ${layout.labelColumnPercent}%) minmax(0, 1fr);
+        }
+        #${elementId} .receipt-label-row > :last-child,
+        #${elementId} .receipt-value-row > :last-child {
+          min-width: 0;
+          text-align: right;
+          overflow-wrap: anywhere;
+        }
+        #${elementId} .receipt-rule {
+          width: 100%;
+          margin: ${layout.ruleGap} 0;
+          overflow: hidden;
+          font-size: ${layout.metaFontSizePx}px;
+          line-height: 1;
+          text-align: center;
+          white-space: nowrap;
+          overflow-wrap: normal;
+          word-break: normal;
+        }
+        #${elementId} .receipt-items,
+        #${elementId} .receipt-tax,
+        #${elementId} .receipt-totals,
+        #${elementId} .receipt-date,
+        #${elementId} .receipt-footer {
+          margin-top: ${layout.sectionGap};
+        }
+        #${elementId} .receipt-thank-you {
+          margin-top: ${layout.rowGap};
+        }
+        #${elementId} .receipt-item {
+          margin-bottom: ${layout.itemGap};
+        }
+        #${elementId} .receipt-item-name {
+          margin-top: ${layout.rowGap};
+          line-height: ${layout.lineHeight};
+        }
+        #${elementId} .receipt-discount-row {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          gap: 2mm;
+          margin-top: ${layout.rowGap};
+          font-size: ${layout.metaFontSizePx}px;
+          line-height: 1.3;
+        }
+        #${elementId} .receipt-discount-row > :last-child,
+        #${elementId} .receipt-total-row > :last-child {
+          text-align: right;
+        }
+        #${elementId} .receipt-total-row {
+          font-weight: 700;
+        }
         #${elementId} .receipt-total-row * {
-          font-weight: 700 !important;
+          font-weight: 700;
         }
         #${elementId} .receipt-qr-container {
-          display: flex !important;
-          width: 100% !important;
-          justify-content: center !important;
-          align-items: center !important;
-          text-align: center !important;
+          display: flex;
+          width: 100%;
+          min-height: ${layout.qrMinHeight};
+          margin-top: 0;
+          justify-content: center;
+          align-items: center;
+          text-align: center;
         }
         #${elementId} .receipt-qr-code {
-          display: block !important;
-          margin-left: auto !important;
-          margin-right: auto !important;
+          display: block;
+          width: ${layout.qrSize};
+          height: ${layout.qrSize};
+          margin: 0 auto;
+          padding: ${layout.qrPadding};
+          background: #fff;
+        }
+        #${elementId} .receipt-qr-code svg {
+          display: block;
+          width: 100%;
+          height: 100%;
         }
 
         ${enablePrintStyles ? `
@@ -1027,13 +1212,12 @@ export const Receipt = ({
             visibility: visible;
           }
           #${elementId} {
-            position: absolute;
-            left: 50%;
-            top: 0;
-            transform: translateX(-50%);
+            position: static;
             width: ${printContentWidth};
-            margin: 0;
-            padding: 0;
+            max-width: none;
+            top: 0;
+            margin: 0 auto;
+            padding: ${layout.contentPadding};
           }
           @page {
             margin: 0;
@@ -1044,62 +1228,65 @@ export const Receipt = ({
       `}</style>
 
       {effectiveShowHeader && (
-        <div className="mt-1 text-center">
-         
-         
-          <p className="receipt-legal-marker mt-2 whitespace-nowrap text-center font-bold leading-tight">{legalReceiptTitle}</p>
-          <p className={`${businessNameTextClass} ${businessNameWidthClass} font-bold leading-tight`}>{businessNameDisplay}</p>
+        <div className="receipt-header receipt-center">
+          {showReceiptMarkers && <p className="receipt-legal-marker">{legalReceiptTitle}</p>}
+          <p className="receipt-business-name">{businessNameDisplay}</p>
           {sellerAddressLines.length > 0 ? (
             sellerAddressLines.map((line, index) => (
-              <p key={`${line}-${index}`} className={`${metaTextClass} leading-tight`}>
+              <p key={`${line}-${index}`} className="receipt-meta">
                 {line.toUpperCase()}
               </p>
             ))
           ) : (
-            <p className={`${metaTextClass} leading-tight`}>ADDRESS: N/A</p>
+            <p className="receipt-meta">ADDRESS: N/A</p>
           )}
-          <p className={`${metaTextClass} leading-tight`}>CELL: {businessPhone || 'N/A'}</p>
-          <p className={`${metaTextClass} leading-tight`}>EMAIL: {businessEmail || 'N/A'}</p>
-          <p className={`${bodyTextClass} leading-tight`}>TIN: {sellerTin || 'N/A'}</p>
-          <p className={`receipt-vat-status ${bodyTextClass} font-bold leading-tight`}>{vatRegistrationLabel.toUpperCase()}</p>
+          <p className="receipt-meta">CELL: {businessPhone || 'N/A'}</p>
+          <p className="receipt-meta">EMAIL: {businessEmail || 'N/A'}</p>
+          <p className="receipt-body">TIN: {sellerTin || 'N/A'}</p>
+          <p
+            className="receipt-vat-status receipt-body"
+            style={{ display: 'block', width: '100%', margin: '0 auto', textAlign: 'center' }}
+          >
+            {vatRegistrationLabel.toUpperCase()}
+          </p>
           {isCopyReceipt && (
-            <p className={`${bodyTextClass} text-center font-bold leading-tight`}>
+            <p className="receipt-copy-marker">
               {receiptTypeLabel}
             </p>
           )}
-          {taxOfficeLabel && <p className={`${metaTextClass} leading-tight`}>{taxOfficeLabel.toUpperCase()}</p>}
-          {pumpName && <p className={`${metaTextClass} leading-tight`}>PUMP: {pumpName.toUpperCase()}</p>}
+          {taxOfficeLabel && <p className="receipt-meta">{taxOfficeLabel.toUpperCase()}</p>}
+          {pumpName && <p className="receipt-meta">PUMP: {pumpName.toUpperCase()}</p>}
         </div>
       )}
 
-      <div className={`mt-5 space-y-0.5 ${bodyTextClass}`}>
-        <div className="grid grid-cols-[auto_1fr] gap-x-2">
-          <span>Buyers Name:</span>
-          <span className="text-right break-words">{buyerName || 'Walk-in Customer'}</span>
+      <div className="receipt-order-meta receipt-body">
+        <div className="receipt-label-row">
+          <span>{receiptLabels.buyer}</span>
+          <span>{buyerName || 'Walk-in Customer'}</span>
         </div>
-        <div className="grid grid-cols-[auto_1fr] gap-x-2">
-          <span>Buyers Tin:</span>
-          <span className="text-right break-all">{buyerTin || 'N/A'}</span>
+        <div className="receipt-label-row">
+          <span>{receiptLabels.buyerTin}</span>
+          <span>{buyerTin || 'N/A'}</span>
         </div>
-        <div className="grid grid-cols-[auto_1fr] gap-x-2">
-          <span>Receipt Number:</span>
-          <span className="text-right break-all font-semibold">{receiptNumberDisplay}</span>
+        <div className="receipt-label-row">
+          <span>{receiptLabels.receiptNumber}</span>
+          <span>{receiptNumberDisplay}</span>
         </div>
-        <div className="grid grid-cols-[auto_1fr] gap-x-2">
-          <span>POS Ref:</span>
-          <span className="text-right break-all font-semibold">{posReferenceDisplay}</span>
+        <div className="receipt-label-row">
+          <span>{receiptLabels.posReference}</span>
+          <span>{posReferenceDisplay}</span>
         </div>
         {!isFiscalizedReceipt && (
-          <div className="grid grid-cols-[auto_1fr] gap-x-2">
-            <span>Receipt Status:</span>
-            <span className="text-right font-semibold">{fiscalStatusDisplay}</span>
+          <div className="receipt-label-row">
+            <span>{receiptLabels.receiptStatus}</span>
+            <span>{fiscalStatusDisplay}</span>
           </div>
         )}
       </div>
 
       {effectiveShowItemDetails && (
-        <div className={`mt-2 ${bodyTextClass}`}>
-          <p className="whitespace-nowrap text-center leading-none">{legalRule}</p>
+        <div className="receipt-items receipt-body">
+          <p className="receipt-rule">{legalRule}</p>
           {orderItems.map((item, index) => {
             const itemPrice = toFiniteNumber(item.price, 0);
             const itemQuantity = Math.max(1, toFiniteNumber(item.quantity, 1));
@@ -1112,16 +1299,16 @@ export const Receipt = ({
             const itemDiscountName = String(item.discount_name ?? item.discountName ?? 'Discount').trim() || 'Discount';
 
             return (
-              <div key={`${item.id}-${index}`} className="mb-1">
-                <div className="flex items-start justify-between gap-2">
-                  <span className="whitespace-nowrap">{formatReceiptQuantity(itemQuantity)} X {formatReceiptAmount(itemPrice)}</span>
-                  <span className="whitespace-nowrap text-right font-semibold">{formatReceiptAmount(itemTotal)} {itemTaxCode}</span>
+              <div key={`${item.id}-${index}`} className="receipt-item">
+                <div className="receipt-value-row">
+                  <span>{formatReceiptQuantity(itemQuantity)} X {formatReceiptAmount(itemPrice)}</span>
+                  <span>{formatReceiptAmount(itemTotal)} {itemTaxCode}</span>
                 </div>
-                <p className="leading-tight">{compactReceiptText(item.name)}</p>
+                <p className="receipt-item-name">{compactReceiptText(item.name)}</p>
                 {itemDiscount > 0 && (
-                  <div className="flex items-start justify-between gap-2 text-[0.9em]">
-                    <span className="truncate">{compactReceiptText(itemDiscountName).toUpperCase()}</span>
-                    <span className="whitespace-nowrap text-right">-{formatReceiptAmount(itemDiscount)}</span>
+                  <div className="receipt-discount-row">
+                    <span>{compactReceiptText(itemDiscountName).toUpperCase()}</span>
+                    <span>-{formatReceiptAmount(itemDiscount)}</span>
                   </div>
                 )}
               </div>
@@ -1131,30 +1318,30 @@ export const Receipt = ({
       )}
 
       {effectiveShowTaxBreakdown && (legalTaxBreakdown.length > 0 || legalLevyBreakdown.length > 0) && (
-        <div className={`mt-2 ${bodyTextClass}`}>
-          <p className="whitespace-nowrap text-center leading-none">{legalRule}</p>
+        <div className="receipt-tax receipt-body">
+          <p className="receipt-rule">{legalRule}</p>
           {legalTaxBreakdown.map((tax, index) => {
             const rateText = formatReceiptRate(tax.rate);
             const rateLabel = `${tax.code}-${rateText}%`;
             return (
               <React.Fragment key={`${rateLabel}-${index}`}>
-                <div className="flex justify-between gap-2">
+                <div className="receipt-value-row">
                   <span>TAXABLE {rateLabel}</span>
                   <span>{formatReceiptAmount(tax.taxableValue)}</span>
                 </div>
-                <div className="flex justify-between gap-2">
+                <div className="receipt-value-row">
                   <span>VAT {rateLabel}</span>
                   <span>{formatReceiptAmount(tax.vatAmount)}</span>
                 </div>
               </React.Fragment>
             );
           })}
-          <div className="flex justify-between gap-2 font-semibold">
+          <div className="receipt-value-row">
             <span>TOTAL VAT:</span>
             <span>{formatReceiptAmount(receiptVatTotal)}</span>
           </div>
           {legalLevyBreakdown.map((levy, index) => (
-            <div key={`${levy.levyTypeId}-${levy.levyRate}-${index}`} className="flex justify-between gap-2">
+            <div key={`${levy.levyTypeId}-${levy.levyRate}-${index}`} className="receipt-value-row">
               <span>LEVY {levy.levyTypeId}-{formatReceiptRate(levy.levyRate)}%</span>
               <span>{formatReceiptAmount(levy.levyAmount)}</span>
             </div>
@@ -1162,40 +1349,39 @@ export const Receipt = ({
         </div>
       )}
 
-      <div className={`mt-2 ${bodyTextClass}`}>
-        <p className="whitespace-nowrap text-center leading-none">{legalRule}</p>
+      <div className="receipt-totals receipt-body">
+        <p className="receipt-rule">{legalRule}</p>
         {receiptDiscountTotal > 0 && (
-          <div className="flex justify-between gap-2">
+          <div className="receipt-value-row">
             <span>TOTAL DISCOUNT:</span>
             <span>{formatReceiptAmount(receiptDiscountTotal)}</span>
           </div>
         )}
-        <div className="receipt-total-row flex justify-between gap-2 font-bold">
+        <div className="receipt-value-row receipt-total-row">
           <span>TOTAL:</span>
           <span>{formatReceiptAmount(normalizedFinalPayable)}</span>
         </div>
-        <div className="flex justify-between gap-2">
-          <span>Amount Tendered:</span>
+        <div className="receipt-value-row">
+          <span>{receiptLabels.amountTendered}</span>
           <span>{formatReceiptAmount(tenderedAmount)}</span>
         </div>
-        <div className="flex justify-between gap-2">
+        <div className="receipt-value-row">
           <span>Change:</span>
           <span>{formatReceiptAmount(receiptChangeDisplay)}</span>
         </div>
         {paymentMethodDisplay && (
-          <div className="flex justify-between gap-2">
-            <span>Payment:</span>
+          <div className="receipt-value-row">
+            <span>{receiptLabels.payment}</span>
             <span>{paymentMethodDisplay}</span>
           </div>
         )}
       </div>
 
-      <div className={`mt-5 text-center ${bodyTextClass}`}>
+      <div className="receipt-date receipt-center receipt-body">
         <p>DATE: {format(orderDate, 'yyyy-MM-dd')} TIME: {format(orderDate, 'HH:mm:ss')}</p>
-        {hasEisVerificationData && <p>Scan Here For Receipt Details</p>}
         {shouldRenderQr ? (
-          <div className="receipt-qr-container flex flex-col items-center justify-center pt-2" style={qrContainerStyle}>
-            <div className="receipt-qr-code bg-white p-1" style={qrSizeStyle} aria-label="Receipt validation QR code">
+          <div className="receipt-qr-container" style={qrContainerStyle}>
+            <div className="receipt-qr-code" style={qrSizeStyle} aria-label="Receipt validation QR code">
               <QRCode
                 value={qrPayload}
                 size={256}
@@ -1204,15 +1390,12 @@ export const Receipt = ({
               />
             </div>
           </div>
-        ) : hasEisVerificationData ? (
-          <p className={`${metaTextClass} mt-2 font-semibold`}>QR PENDING</p>
         ) : null}
       </div>
 
-      {effectiveShowFooter && (
-        <div className={`mt-5 text-center ${bodyTextClass}`}>
-          <p className="receipt-legal-marker whitespace-nowrap text-center font-bold">{legalReceiptEndTitle}</p>
-          <p className="mt-2">THANK YOU!</p>
+      {effectiveShowFooter && showReceiptMarkers && (
+        <div className="receipt-footer receipt-center receipt-body">
+          <p className="receipt-legal-marker">{legalReceiptEndTitle}</p>
         </div>
       )}
     </div>
