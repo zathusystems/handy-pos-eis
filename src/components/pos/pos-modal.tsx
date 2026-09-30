@@ -34,7 +34,11 @@ import { getBackendConnectionIssue, getBackendReachabilitySnapshot, useBackendRe
 import { authFetch } from '@/lib/auth-fetch';
 import { logAuditAction } from '@/lib/audit';
 import { warmBranchMraMappingCache } from '@/lib/mra-mapping-cache';
-import { syncInventoryFromBackend } from '@/lib/services/inventory-sync';
+import {
+  getMraProductSyncError,
+  getMraTerminalSyncError,
+  syncInventoryFromBackend,
+} from '@/lib/services/inventory-sync';
 import { safeLocalStorageGetItem, safeLocalStorageSetItem } from '@/lib/safe-local-storage';
 import { ensureTauriDeviceIdentity, getDeviceSerial } from '@/lib/device-identity';
 import { formatInventoryQuantity } from '@/lib/quantity-format';
@@ -1210,7 +1214,7 @@ export function PosModal({ branchId, isOpen, onOpenChange }: PosModalProps) {
       const terminal = findCurrentDeviceTerminal(terminals, normalizedBranchId);
 
       if (!terminal?.id || String(terminal?.status || '').toLowerCase() !== 'active') {
-        throw new Error('Activate this device first.');
+        throw new Error(getMraTerminalSyncError(terminals, normalizedBranchId));
       }
 
       const pullResponse = await authFetch.fetch<any>(
@@ -1265,7 +1269,7 @@ export function PosModal({ branchId, isOpen, onOpenChange }: PosModalProps) {
       return { ok: true };
     } catch (error: any) {
       console.error('[POS Modal] Failed to sync MRA products:', error);
-      return fail('Product sync failed', 'Try again.');
+      return fail('Product sync failed', getMraProductSyncError(error));
     } finally {
       setIsSyncingMraProducts(false);
     }

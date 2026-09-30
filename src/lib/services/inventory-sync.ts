@@ -64,6 +64,63 @@ function findCurrentDeviceTerminal(terminals: any[], branchId: string): any {
   );
 }
 
+export function getMraTerminalSyncError(terminals: any[], branchId: string): string {
+  const normalizedBranchId = normalizeBranchId(branchId);
+  const branchTerminals = terminals.filter(
+    (item) => normalizeBranchId(getApiBranchId(item)) === normalizedBranchId
+  );
+
+  if (branchTerminals.length === 0) {
+    return 'No EIS terminal is linked to this branch.';
+  }
+
+  const currentDeviceSerial = getDeviceSerial().toLowerCase();
+  const deviceTerminal = branchTerminals.find(
+    (item) => getApiDeviceSerial(item).toLowerCase() === currentDeviceSerial
+  );
+
+  if (!deviceTerminal) {
+    return 'This device is not activated for the selected branch.';
+  }
+
+  if (String(deviceTerminal?.status || '').toLowerCase() !== 'active') {
+    return 'The EIS terminal for this branch is inactive.';
+  }
+
+  return 'The EIS terminal for this branch is not ready.';
+}
+
+export function getMraProductSyncError(error: unknown): string {
+  const rawMessage = error instanceof Error
+    ? error.message
+    : typeof error === 'string'
+      ? error
+      : '';
+  const message = rawMessage.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  const normalized = message.toLowerCase();
+
+  if (!message || /^http \d{3}$/i.test(message)) {
+    return 'MRA EIS is temporarily unavailable. Try again later.';
+  }
+
+  if (
+    normalized.includes('500.30') ||
+    normalized.includes('gateway timeout') ||
+    normalized.includes('temporarily unavailable') ||
+    normalized.includes('mra request failed') ||
+    normalized.includes('html server error') ||
+    normalized.includes('<!doctype')
+  ) {
+    return 'MRA EIS is temporarily unavailable. Try again later.';
+  }
+
+  if (message.length > 240) {
+    return 'MRA EIS returned an unexpected response. Try again later.';
+  }
+
+  return message;
+}
+
 /**
  * Convert snake_case to camelCase
  */
@@ -443,7 +500,7 @@ export async function refreshInventoryFromMraApprovedProducts(
         created: 0,
         updated: 0,
         synced: 0,
-        error: 'Activate this device first.',
+        error: getMraTerminalSyncError(terminals, normalizedBranchId),
       };
     }
 
@@ -492,7 +549,7 @@ export async function refreshInventoryFromMraApprovedProducts(
       created: 0,
       updated: 0,
       synced: 0,
-      error: 'Could not sync products from MRA.',
+      error: getMraProductSyncError(error),
     };
   }
 }

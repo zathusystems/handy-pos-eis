@@ -3469,6 +3469,17 @@ class ProductMappingService:
             product for product in ProductMappingService._active_mra_catalog_index(business).values()
             if product.get('is_approved')
         ]
+        branch_site_id = str(
+            getattr(branch, 'mra_site_id', '') or getattr(branch, 'mra_branch_code', '') or ''
+        ).strip().casefold()
+        if branch_site_id:
+            # Keep global catalog entries, but never import a site-tagged item
+            # belonging to a different EIS branch.
+            approved_products = [
+                product for product in approved_products
+                if not str(product.get('site_id') or '').strip()
+                or str(product.get('site_id') or '').strip().casefold() == branch_site_id
+            ]
 
         created_count = 0
         updated_count = 0
@@ -4070,10 +4081,48 @@ class ProductMappingService:
                 .order_by('-updated_at')
                 .first()
             )
+        branch = terminal.branch if terminal is not None else None
+        if branch is not None:
+            branch_site_id = str(
+                getattr(branch, 'mra_site_id', '') or getattr(branch, 'mra_branch_code', '') or ''
+            ).strip()
+            if not branch_site_id:
+                # Configuration sync can populate the selected branch from the
+                # official EIS site list before the site-products request.
+                EISBranchSyncService.sync_for_business(business, terminal=terminal)
+                branch.refresh_from_db()
+                branch_site_id = str(
+                    getattr(branch, 'mra_site_id', '') or getattr(branch, 'mra_branch_code', '') or ''
+                ).strip()
+
+            if not branch_site_id:
+                from business.models import Branch
+
+                another_branch_is_mapped = (
+                    Branch.objects.filter(business=business, is_active=True)
+                    .exclude(pk=branch.pk)
+                    .filter(mra_site_id__isnull=False)
+                    .exclude(mra_site_id='')
+                    .exists()
+                    or Branch.objects.filter(business=business, is_active=True)
+                    .exclude(pk=branch.pk)
+                    .filter(mra_branch_code__isnull=False)
+                    .exclude(mra_branch_code='')
+                    .exists()
+                )
+                if another_branch_is_mapped:
+                    raise ValueError(
+                        'This branch is not linked to an MRA EIS site. Sync the EIS branch mapping before pulling products.'
+                    )
+
         site_id = ConfigurationService.get_terminal_site_id(
             business,
-            terminal.branch if terminal else None,
+            branch,
         )
+        if branch is not None and not site_id:
+            raise ValueError(
+                'This branch is not linked to an MRA EIS site. Sync the EIS branch mapping before pulling products.'
+            )
         payload = {
             'tin': business.tin or '',
             'siteId': site_id,
