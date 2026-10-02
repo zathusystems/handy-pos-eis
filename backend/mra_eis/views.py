@@ -1,6 +1,7 @@
 """
 MRA EIS API Views - REST endpoints for MRA integration
 """
+import logging
 import re
 
 from rest_framework import viewsets, status
@@ -30,6 +31,8 @@ from .services import (
 )
 from .services.core import _is_mra_network_failure
 from rest_framework.views import APIView
+
+logger = logging.getLogger(__name__)
 
 
 def _get_accessible_business_queryset(user):
@@ -524,6 +527,22 @@ class TerminalViewSet(viewsets.ModelViewSet):
         except ValueError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
+            logger.exception(
+                '[MRA PRODUCT SYNC] failed terminal_pk=%s terminal_id=%s branch_id=%s '
+                'error=%s',
+                terminal.pk,
+                terminal.terminal_id,
+                terminal.branch_id,
+                e,
+            )
+            if _is_mra_network_failure(e, status_code=getattr(e, 'status_code', None)):
+                return Response(
+                    {
+                        'error': 'MRA EIS is temporarily unavailable. Try again later.',
+                        'code': 'mra_network_unreachable',
+                    },
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
             return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
 
     @action(detail=True, methods=['post'])

@@ -4128,6 +4128,13 @@ class ProductMappingService:
             'siteId': site_id,
         }
 
+        logger.warning(
+            '[MRA PRODUCT SYNC] requesting terminal_id=%s branch_id=%s site_id=%s',
+            getattr(terminal, 'terminal_id', ''),
+            getattr(branch, 'id', ''),
+            site_id,
+        )
+
         client = MRAEISClient(terminal=terminal)
         result = client.call(
             'get_terminal_site_products',
