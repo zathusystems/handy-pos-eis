@@ -3502,6 +3502,63 @@ class ProductMappingTests(TestCase):
         self.assertTrue(mapping.mra_synced)
         ProductMappingService.validate_product_for_sale(self.business, str(item.id))
 
+    def test_pull_approved_products_skips_catalog_values_that_exceed_inventory_precision(self):
+        """One malformed MRA value must not make the whole branch sync fail."""
+        terminal = Terminal.objects.create(
+            business=self.business,
+            branch=self.branch,
+            terminal_id='TERM-PULL-PRECISION-001',
+            device_serial='DEVICE-PULL-PRECISION-001',
+            pos_name='Handy POS',
+            pos_version='1.0.0',
+            os_type='Web',
+            mra_terminal_id='MRA-TERM-PULL-PRECISION-001',
+            mra_api_key='secret',
+            mra_token='token',
+            status='active',
+        )
+        MRAConfiguration.objects.create(
+            business=self.business,
+            config_type='terminal_site_products',
+            config_version='site-products-precision',
+            config_data={
+                'data': [
+                    {
+                        'productCode': 'MRA-TOO-LARGE',
+                        'productName': 'Malformed MRA Quantity',
+                        'quantity': '999999999999999999999',
+                        'price': '100.00',
+                        'isProduct': True,
+                    },
+                    {
+                        'productCode': 'MRA-VALID-001',
+                        'productName': 'Valid MRA Product',
+                        'quantity': '4',
+                        'price': '100.00',
+                        'isProduct': True,
+                    },
+                ]
+            },
+            effective_from=timezone.now(),
+            fetched_from_mra_at=timezone.now(),
+            is_active=True,
+        )
+
+        result = ProductMappingService.pull_approved_products_to_inventory(
+            business=self.business,
+            terminal=terminal,
+            refresh_from_mra=False,
+        )
+
+        self.assertEqual(result['product_count'], 2)
+        self.assertEqual(result['imported_product_count'], 1)
+        self.assertEqual(result['created'], 1)
+        self.assertEqual(result['skipped_invalid_count'], 1)
+        self.assertEqual(result['skipped_invalid_products'][0]['mra_product_code'], 'MRA-TOO-LARGE')
+        self.assertEqual(result['skipped_invalid_products'][0]['fields'], ['quantity'])
+        self.assertFalse(InventoryItem.objects.filter(product_code='MRA-TOO-LARGE').exists())
+        self.assertTrue(InventoryItem.objects.filter(product_code='MRA-VALID-001').exists())
+
     def test_pull_approved_products_is_scoped_to_terminal_branch_site(self):
         """A branch must not import products belonging to another EIS site."""
         self.branch.mra_site_id = 'SITE-BRANCH-A'

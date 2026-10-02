@@ -3153,10 +3153,42 @@ class ProductMappingService:
         return 'standard', Decimal('16.50')
 
     @staticmethod
-    def _catalog_decimal(value: Any, decimal_places: str, fallback: Decimal | None = None) -> Decimal:
+    def _catalog_decimal(
+        value: Any,
+        decimal_places: str,
+        fallback: Decimal | None = None,
+        *,
+        max_digits: int | None = None,
+        invalid_fields: list[str] | None = None,
+        field_name: str = '',
+    ) -> Decimal:
+        """Normalize an MRA number without allowing it to overflow a local field."""
+        quantizer = Decimal(decimal_places)
+        fallback_value = (fallback if fallback is not None else Decimal('0')).quantize(quantizer)
         if value in (None, ''):
-            return (fallback if fallback is not None else Decimal('0')).quantize(Decimal(decimal_places))
-        return ProductMappingService._decimal_from_initial_inventory_number(value, decimal_places)
+            return fallback_value
+
+        try:
+            parsed = Decimal(str(value).strip())
+            if not parsed.is_finite():
+                raise InvalidOperation
+
+            if max_digits is not None:
+                max_integer_digits = max_digits - abs(quantizer.as_tuple().exponent)
+                # Avoid Decimal.quantize() itself raising for an enormous API value.
+                if parsed != 0 and parsed.copy_abs().adjusted() >= max_integer_digits:
+                    raise InvalidOperation
+
+            parsed = parsed.quantize(quantizer)
+            if max_digits is not None:
+                max_integer_digits = max_digits - abs(quantizer.as_tuple().exponent)
+                if parsed.copy_abs() >= Decimal(10) ** max_integer_digits:
+                    raise InvalidOperation
+            return parsed
+        except (InvalidOperation, TypeError, ValueError):
+            if invalid_fields is not None and field_name and field_name not in invalid_fields:
+                invalid_fields.append(field_name)
+            return fallback_value
 
     @staticmethod
     def _catalog_expiry_date(value: Any):
@@ -3198,13 +3230,24 @@ class ProductMappingService:
         raw_tax_rate = ProductMappingService._catalog_first(item, [
             'default_tax_rate', 'defaultTaxRate', 'tax_rate', 'taxRate', 'vat_rate', 'vatRate',
         ])
+        catalog_validation_errors: list[str] = []
         if raw_tax_rate is None and tax_rate_id not in (None, ''):
             tax_type, tax_rate = ProductMappingService._tax_details_from_rate_id(business, tax_rate_id)
         else:
-            tax_rate = ProductMappingService._decimal_from_initial_inventory_number(
+            tax_rate = ProductMappingService._catalog_decimal(
                 raw_tax_rate if raw_tax_rate is not None else (0 if tax_type in {'zero', 'exempt'} else 16.5),
                 '0.01',
+                max_digits=5,
+                invalid_fields=catalog_validation_errors,
+                field_name='tax_rate',
             )
+        tax_rate = ProductMappingService._catalog_decimal(
+            tax_rate,
+            '0.01',
+            max_digits=5,
+            invalid_fields=catalog_validation_errors,
+            field_name='tax_rate',
+        )
         tax_method = ProductMappingService._normalize_mapping_tax_method(
             ProductMappingService._catalog_first(item, [
                 'taxCalculationMethod', 'tax_calculation_method', 'calculationMethod',
@@ -3225,14 +3268,23 @@ class ProductMappingService:
         quantity = ProductMappingService._catalog_decimal(
             ProductMappingService._catalog_first(item, ['quantity', 'quantityInStock', 'stockQuantity', 'stock_units']),
             '0.001',
+            max_digits=12,
+            invalid_fields=catalog_validation_errors,
+            field_name='quantity',
         )
         price = ProductMappingService._catalog_decimal(
             ProductMappingService._catalog_first(item, ['price', 'sellingPrice', 'unitPrice']),
             '0.01',
+            max_digits=10,
+            invalid_fields=catalog_validation_errors,
+            field_name='price',
         )
         minimum_stock = ProductMappingService._catalog_decimal(
             ProductMappingService._catalog_first(item, ['minimumStockLevel', 'minimum_stock_level', 'reorderLevel']),
             '0.001',
+            max_digits=12,
+            invalid_fields=catalog_validation_errors,
+            field_name='minimum_stock',
         )
         levies = ProductMappingService.normalize_levies(
             ProductMappingService._catalog_first(
@@ -3274,6 +3326,7 @@ class ProductMappingService:
             'site_id': str(ProductMappingService._catalog_first(item, ['siteId', 'site_id']) or '').strip(),
             'is_product': is_product,
             'is_approved': is_approved,
+            'catalog_validation_errors': catalog_validation_errors,
             'levies': levies,
             'raw': item,
         }
@@ -3488,8 +3541,24 @@ class ProductMappingService:
         imported_items: list[dict[str, Any]] = []
         imported_mappings: list[dict[str, Any]] = []
         taxpayer_incompatible: list[dict[str, Any]] = []
+        skipped_invalid_products: list[dict[str, Any]] = []
 
         for product in approved_products:
+            validation_errors = product.get('catalog_validation_errors') or []
+            if validation_errors:
+                skipped_invalid_products.append({
+                    'mra_product_code': str(product.get('display_code') or product.get('code') or '').strip(),
+                    'name': str(product.get('name') or '').strip(),
+                    'fields': validation_errors,
+                })
+                logger.warning(
+                    '[MRA PRODUCT SYNC] skipped catalog product with values outside local field limits '
+                    'code=%s fields=%s',
+                    product.get('display_code') or product.get('code'),
+                    ','.join(validation_errors),
+                )
+                continue
+
             item, match_reason = ProductMappingService._find_inventory_item_for_catalog_product(
                 business,
                 branch,
@@ -3501,7 +3570,27 @@ class ProductMappingService:
             reorder_level = product.get('minimum_stock') or Decimal('0.000')
             price = product.get('price') or Decimal('0.00')
             cost = getattr(item, 'cost', None) if item else None
-            value = (quantity * (cost or Decimal('0.00'))).quantize(Decimal('0.01'))
+            validation_errors = list(product.get('catalog_validation_errors') or [])
+            value = ProductMappingService._catalog_decimal(
+                quantity * (cost or Decimal('0.00')),
+                '0.01',
+                max_digits=12,
+                invalid_fields=validation_errors,
+                field_name='value',
+            )
+            if validation_errors:
+                skipped_invalid_products.append({
+                    'mra_product_code': display_code,
+                    'name': str(product.get('name') or '').strip(),
+                    'fields': validation_errors,
+                })
+                logger.warning(
+                    '[MRA PRODUCT SYNC] skipped catalog product with values outside local field limits '
+                    'code=%s fields=%s',
+                    display_code,
+                    ','.join(validation_errors),
+                )
+                continue
             category = 'MRA Approved Products' if product.get('is_product', True) else 'MRA Approved Services'
             unit_measure = str(product.get('unit_measure') or 'unit').strip()[:50] or 'unit'
 
@@ -3639,10 +3728,13 @@ class ProductMappingService:
         return {
             'pulled': True,
             'product_count': len(approved_products),
+            'imported_product_count': len(imported_items),
             'created': created_count,
             'updated': updated_count,
             'mappings_created': mapping_created_count,
             'mappings_updated': mapping_updated_count,
+            'skipped_invalid_count': len(skipped_invalid_products),
+            'skipped_invalid_products': skipped_invalid_products[:50],
             'taxpayer_incompatible_count': len(taxpayer_incompatible),
             'taxpayer_incompatible': taxpayer_incompatible[:50],
             'branch_id': str(branch.id),
