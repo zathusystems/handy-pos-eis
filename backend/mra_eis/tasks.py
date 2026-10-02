@@ -46,6 +46,7 @@ def sync_offline_invoices_for_online_terminals():
 
     synced_total = 0
     failed_total = 0
+    expired_total = 0
     terminal_count = terminals.count()
 
     _print_replay(
@@ -63,6 +64,7 @@ def sync_offline_invoices_for_online_terminals():
             result = InvoiceService.sync_offline_invoices(terminal)
             synced_total += int(result.get('synced', 0))
             failed_total += int(result.get('failed', 0))
+            expired_total += int(result.get('expired', 0))
         except Exception as exc:
             failed_total += 1
             logger.exception(
@@ -74,11 +76,12 @@ def sync_offline_invoices_for_online_terminals():
 
     _print_replay(
         f'[MRA REPLAY TASK] complete terminals={terminal_count} '
-        f'synced={synced_total} failed={failed_total}'
+        f'synced={synced_total} failed={failed_total} expired={expired_total}'
     )
 
     return {
         'terminals': terminal_count,
         'synced': synced_total,
         'failed': failed_total,
+        'expired': expired_total,
     }

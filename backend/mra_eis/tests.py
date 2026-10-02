@@ -3944,9 +3944,15 @@ class OfflineInvoiceTests(TransactionTestCase):
 
         queue_entry.refresh_from_db()
         self.assertEqual(result['synced'], 0)
-        self.assertEqual(result['failed'], 1)
-        self.assertEqual(queue_entry.status, 'failed')
+        self.assertEqual(result['failed'], 0)
+        self.assertEqual(result['expired'], 1)
+        self.assertEqual(queue_entry.status, 'expired')
         self.assertIn('age exceeds configured limit', queue_entry.last_sync_error.lower())
+
+        second_result = InvoiceService.sync_offline_invoices(self.terminal)
+        self.assertEqual(second_result['synced'], 0)
+        self.assertEqual(second_result['failed'], 0)
+        self.assertEqual(second_result['expired'], 0)
 
     @override_settings(
         MRA_EIS_DRY_RUN=False,

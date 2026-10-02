@@ -550,12 +550,14 @@ class OfflineInvoiceQueue(models.Model):
         ('syncing', 'Syncing'),
         ('synced', 'Synced'),
         ('failed', 'Failed'),
+        ('expired', 'Expired - MRA time limit exceeded'),
     ]
     SYNC_STATE_MAP = {
         'queued': 'PENDING',
         'syncing': 'SENDING',
         'synced': 'SUCCESS',
         'failed': 'FAILED',
+        'expired': 'EXPIRED',
     }
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

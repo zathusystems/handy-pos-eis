@@ -46,6 +46,7 @@ class Command(BaseCommand):
 
         synced_total = 0
         failed_total = 0
+        expired_total = 0
         terminal_count = terminals.count()
         self.stdout.write(
             f'MRA offline replay starting: include_all_active={include_all_active} '
@@ -69,13 +70,15 @@ class Command(BaseCommand):
 
             synced = int(result.get('synced', 0))
             failed = int(result.get('failed', 0))
+            expired = int(result.get('expired', 0))
             synced_total += synced
             failed_total += failed
-            self.stdout.write(f'  synced={synced} failed={failed}')
+            expired_total += expired
+            self.stdout.write(f'  synced={synced} failed={failed} expired={expired}')
 
         self.stdout.write(
             self.style.SUCCESS(
                 f'MRA offline invoice replay complete: terminals={terminal_count} '
-                f'synced={synced_total} failed={failed_total}'
+                f'synced={synced_total} failed={failed_total} expired={expired_total}'
             )
         )

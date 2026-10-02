@@ -6988,16 +6988,54 @@ class InvoiceService:
     @staticmethod
     @transaction.atomic
     def sync_offline_invoices(terminal):
-        queued_entries = OfflineInvoiceQueue.objects.filter(
-            terminal=terminal,
-            status__in=['queued', 'failed'],
-        ).order_by('queue_position')
+        queued_entries = list(
+            OfflineInvoiceQueue.objects.filter(
+                terminal=terminal,
+                status__in=['queued', 'failed'],
+            ).select_related('mra_invoice').order_by('queue_position')
+        )
 
         synced_count = 0
         failed_count = 0
+        expired_count = 0
         offline_limits = ConfigurationService.get_offline_limits(terminal.business)
-        first_entry = queued_entries.first()
-        queue_count = queued_entries.count()
+        if offline_limits.max_transaction_age_hours is not None:
+            checked_at = timezone.now()
+            max_age_hours = float(offline_limits.max_transaction_age_hours)
+            replayable_entries = []
+            for entry in queued_entries:
+                age_hours = (
+                    checked_at - entry.mra_invoice.invoice_date
+                ).total_seconds() / 3600
+                if age_hours <= max_age_hours:
+                    replayable_entries.append(entry)
+                    continue
+
+                error_message = (
+                    'Offline transaction age exceeds configured limit '
+                    f'({age_hours:.2f}h > {offline_limits.max_transaction_age_hours}h).'
+                )
+                entry.status = 'expired'
+                entry.last_sync_error = error_message
+                entry.last_sync_attempt_at = checked_at
+                entry.save(update_fields=[
+                    'status', 'last_sync_error', 'last_sync_attempt_at'
+                ])
+                expired_count += 1
+                logger.warning(
+                    '[MRA REPLAY] expired queue_entry=%s terminal_id=%s position=%s '
+                    'invoice=%s error=%s',
+                    entry.id,
+                    terminal.terminal_id,
+                    entry.queue_position,
+                    entry.mra_invoice.invoice_number,
+                    error_message,
+                )
+
+            queued_entries = replayable_entries
+
+        first_entry = queued_entries[0] if queued_entries else None
+        queue_count = len(queued_entries)
         last_offline_snapshot = None
         sequence_guard: dict[str, Any] = {'checked': False, 'reason': 'empty_queue'}
 
@@ -7070,6 +7108,7 @@ class InvoiceService:
                 return {
                     'synced': 0,
                     'failed': 1,
+                    'expired': expired_count,
                     'blocked': True,
                     'error': str(exc),
                     'sequence_guard': sequence_guard,
@@ -7127,14 +7166,18 @@ class InvoiceService:
                     entry.mra_invoice.invoice_number,
                 )
             except Exception as exc:
-                entry.status = 'failed'
+                is_expired = 'Offline transaction age exceeds configured limit' in str(exc)
+                entry.status = 'expired' if is_expired else 'failed'
                 entry.last_sync_error = str(exc)
                 entry.sync_attempts += 1
                 entry.last_sync_attempt_at = timezone.now()
                 entry.save(
                     update_fields=['status', 'last_sync_error', 'sync_attempts', 'last_sync_attempt_at']
                 )
-                failed_count += 1
+                if is_expired:
+                    expired_count += 1
+                else:
+                    failed_count += 1
                 logger.exception(
                     '[MRA REPLAY] failed queue_entry=%s terminal_id=%s position=%s '
                     'invoice=%s attempts_now=%s error=%s',
@@ -7155,6 +7198,7 @@ class InvoiceService:
             details={
                 'synced_count': synced_count,
                 'failed_count': failed_count,
+                'expired_count': expired_count,
                 'offline_limit_source': offline_limits.source,
                 'max_transaction_age_hours': offline_limits.max_transaction_age_hours,
                 'max_cumulative_amount': (
@@ -7168,14 +7212,15 @@ class InvoiceService:
         )
 
         logger.warning(
-            '[MRA REPLAY] complete terminal_pk=%s terminal_id=%s synced=%s failed=%s',
+            '[MRA REPLAY] complete terminal_pk=%s terminal_id=%s synced=%s failed=%s expired=%s',
             terminal.pk,
             terminal.terminal_id,
             synced_count,
             failed_count,
+            expired_count,
         )
 
-        return {'synced': synced_count, 'failed': failed_count}
+        return {'synced': synced_count, 'failed': failed_count, 'expired': expired_count}
 
 
 class EISSaleComplianceService:

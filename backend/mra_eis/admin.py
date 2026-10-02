@@ -180,6 +180,7 @@ class MRAInvoiceAdmin(admin.ModelAdmin):
             'rejected': 'red',
             'offline_queued': 'orange',
             'offline_synced': 'green',
+            'expired': 'darkred',
         }
         color = colors.get(obj.status, 'gray')
         return format_html(
@@ -221,6 +222,7 @@ class OfflineInvoiceQueueAdmin(admin.ModelAdmin):
             'syncing': 'blue',
             'synced': 'green',
             'failed': 'red',
+            'expired': 'darkred',
         }
         color = colors.get(obj.status, 'gray')
         return format_html(
