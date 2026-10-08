@@ -786,7 +786,7 @@ export const Receipt = ({
     (order as any).seller_vat_status ??
     (order as any).vatStatus ??
     (order as any).vat_status
-  ) || (isSellerVatRegistered ? '*VAT REGISTERED*' : '*NON VAT REGISTERED*');
+  ) || (isSellerVatRegistered ? '*VAT REGISTERED*' : '*NOT VAT REGISTERED*');
   const taxOfficeLabel = toTrimmedString(
     (order as any).taxOffice ??
     (order as any).tax_office ??
@@ -875,6 +875,9 @@ export const Receipt = ({
     (order as any).levy_breakdown,
     ...validationSources
   );
+  const showVatBreakdown = isSellerVatRegistered && effectiveShowTaxBreakdown;
+  const showLevyBreakdown = effectiveShowTaxBreakdown && legalLevyBreakdown.length > 0;
+  const showReceiptTaxSection = (showVatBreakdown && legalTaxBreakdown.length > 0) || showLevyBreakdown;
   const tenderedAmount = receiptAmountPaid > 0 ? receiptAmountPaid : normalizedFinalPayable;
   const legalRule = '-'.repeat(Math.max(16, receiptLineWidth - 2));
   const thermalLine = (text = '') => text.replace(/\s+/g, ' ').trim();
@@ -968,11 +971,16 @@ export const Receipt = ({
       const itemSubtotal = toFiniteNumber(item.subtotal, Math.max(0, itemTotal - toFiniteNumber(item.tax_amount ?? item.taxAmount, 0)));
       const itemVat = toFiniteNumber(item.tax_amount ?? item.taxAmount, Math.max(0, itemTotal - itemSubtotal));
       const itemTaxRate = toFiniteNumber(item.tax_rate ?? item.taxRate, itemVat > 0 && itemSubtotal > 0 ? (itemVat / itemSubtotal) * 100 : 0);
-      const itemTaxCode = resolveTaxCode(itemTaxRate, item.tax_type ?? item.taxType);
+      const itemTaxCode = isSellerVatRegistered
+        ? resolveTaxCode(itemTaxRate, item.tax_type ?? item.taxType)
+        : '';
       const itemDiscount = Math.max(0, toFiniteNumber(item.discount_amount ?? item.discountAmount, 0));
       const itemDiscountName = String(item.discount_name ?? item.discountName ?? 'Discount').trim() || 'Discount';
       thermalTextLines.push(
-        alignThermal(`${formatReceiptQuantity(itemQuantity)} X ${thermalAmount(itemPrice)}`, `${thermalAmount(itemTotal)} ${itemTaxCode}`),
+        alignThermal(
+          `${formatReceiptQuantity(itemQuantity)} X ${thermalAmount(itemPrice)}`,
+          `${thermalAmount(itemTotal)}${itemTaxCode ? ` ${itemTaxCode}` : ''}`
+        ),
         compactReceiptText(item.name)
       );
       if (itemDiscount > 0) {
@@ -981,15 +989,17 @@ export const Receipt = ({
     });
     thermalTextLines.push(legalRule);
   }
-  if (effectiveShowTaxBreakdown && (legalTaxBreakdown.length > 0 || legalLevyBreakdown.length > 0)) {
-    legalTaxBreakdown.forEach((tax) => {
-      const rateLabel = `${tax.code}-${formatReceiptRate(tax.rate)}%`;
-      thermalTextLines.push(
-        alignThermal(`TAXABLE ${rateLabel}`, thermalAmount(tax.taxableValue)),
-        alignThermal(`VAT ${rateLabel}`, thermalAmount(tax.vatAmount))
-      );
-    });
-    thermalTextLines.push(alignThermal('TOTAL VAT:', thermalAmount(receiptVatTotal)));
+  if (showReceiptTaxSection) {
+    if (showVatBreakdown) {
+      legalTaxBreakdown.forEach((tax) => {
+        const rateLabel = `${tax.code}-${formatReceiptRate(tax.rate)}%`;
+        thermalTextLines.push(
+          alignThermal(`TAXABLE ${rateLabel}`, thermalAmount(tax.taxableValue)),
+          alignThermal(`VAT ${rateLabel}`, thermalAmount(tax.vatAmount))
+        );
+      });
+      thermalTextLines.push(alignThermal('TOTAL VAT:', thermalAmount(receiptVatTotal)));
+    }
     legalLevyBreakdown.forEach((levy) => {
       thermalTextLines.push(alignThermal(`LEVY ${levy.levyTypeId}-${formatReceiptRate(levy.levyRate)}%`, thermalAmount(levy.levyAmount)));
     });
@@ -1294,7 +1304,9 @@ export const Receipt = ({
             const itemSubtotal = toFiniteNumber(item.subtotal, Math.max(0, itemTotal - toFiniteNumber(item.tax_amount ?? item.taxAmount, 0)));
             const itemVat = toFiniteNumber(item.tax_amount ?? item.taxAmount, Math.max(0, itemTotal - itemSubtotal));
             const itemTaxRate = toFiniteNumber(item.tax_rate ?? item.taxRate, itemVat > 0 && itemSubtotal > 0 ? (itemVat / itemSubtotal) * 100 : 0);
-            const itemTaxCode = resolveTaxCode(itemTaxRate, item.tax_type ?? item.taxType);
+            const itemTaxCode = isSellerVatRegistered
+              ? resolveTaxCode(itemTaxRate, item.tax_type ?? item.taxType)
+              : '';
             const itemDiscount = Math.max(0, toFiniteNumber(item.discount_amount ?? item.discountAmount, 0));
             const itemDiscountName = String(item.discount_name ?? item.discountName ?? 'Discount').trim() || 'Discount';
 
@@ -1302,7 +1314,7 @@ export const Receipt = ({
               <div key={`${item.id}-${index}`} className="receipt-item">
                 <div className="receipt-value-row">
                   <span>{formatReceiptQuantity(itemQuantity)} X {formatReceiptAmount(itemPrice)}</span>
-                  <span>{formatReceiptAmount(itemTotal)} {itemTaxCode}</span>
+                  <span>{formatReceiptAmount(itemTotal)}{itemTaxCode ? ` ${itemTaxCode}` : ''}</span>
                 </div>
                 <p className="receipt-item-name">{compactReceiptText(item.name)}</p>
                 {itemDiscount > 0 && (
@@ -1317,10 +1329,10 @@ export const Receipt = ({
         </div>
       )}
 
-      {effectiveShowTaxBreakdown && (legalTaxBreakdown.length > 0 || legalLevyBreakdown.length > 0) && (
+      {showReceiptTaxSection && (
         <div className="receipt-tax receipt-body">
           <p className="receipt-rule">{legalRule}</p>
-          {legalTaxBreakdown.map((tax, index) => {
+          {showVatBreakdown && legalTaxBreakdown.map((tax, index) => {
             const rateText = formatReceiptRate(tax.rate);
             const rateLabel = `${tax.code}-${rateText}%`;
             return (
@@ -1336,10 +1348,12 @@ export const Receipt = ({
               </React.Fragment>
             );
           })}
-          <div className="receipt-value-row">
-            <span>TOTAL VAT:</span>
-            <span>{formatReceiptAmount(receiptVatTotal)}</span>
-          </div>
+          {showVatBreakdown && (
+            <div className="receipt-value-row">
+              <span>TOTAL VAT:</span>
+              <span>{formatReceiptAmount(receiptVatTotal)}</span>
+            </div>
+          )}
           {legalLevyBreakdown.map((levy, index) => (
             <div key={`${levy.levyTypeId}-${levy.levyRate}-${index}`} className="receipt-value-row">
               <span>LEVY {levy.levyTypeId}-{formatReceiptRate(levy.levyRate)}%</span>

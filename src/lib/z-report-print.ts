@@ -392,7 +392,7 @@ export const buildZReportPrintHtml = ({
     ...(businessDetails.phone ? [centerLine(`CELL: ${businessDetails.phone}`)] : []),
     ...(businessDetails.email ? [centerLine(`EMAIL: ${businessDetails.email}`)] : []),
     ...(businessDetails.tin ? [centerLine(`TIN: ${businessDetails.tin}`)] : []),
-    centerLine(businessDetails.vatRegistered ? '*VAT REGISTERED*' : '*NON VAT REGISTERED*'),
+    centerLine(businessDetails.vatRegistered ? '*VAT REGISTERED*' : '*NOT VAT REGISTERED*'),
     ...(businessDetails.taxOffice ? [centerLine(businessDetails.taxOffice)] : []),
     '--------------------------------',
     SESSION_END_REPORT_TITLE.toUpperCase(),

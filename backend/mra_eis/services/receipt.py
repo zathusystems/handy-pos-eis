@@ -206,7 +206,7 @@ class ReceiptService:
             receipt_lines.append(ReceiptService._center_line(f'EMAIL: {email}'))
         receipt_lines.extend([
             ReceiptService._center_line(f'TIN: {seller_tin}'),
-            ReceiptService._center_line('*VAT REGISTERED*' if is_vat_registered else '*NON VAT REGISTERED*'),
+            ReceiptService._center_line('*VAT REGISTERED*' if is_vat_registered else '*NOT VAT REGISTERED*'),
             '',
             f'Buyers Name: {buyer_name}',
             f'Buyers Tin: {buyer_tin}',
@@ -224,11 +224,16 @@ class ReceiptService:
             line_total = Decimal(str(item.get('total') or 0))
             if line_total == 0:
                 line_total = Decimal(str(quantity or 0)) * Decimal(str(unit_price or 0))
-            tax_code = ReceiptService._tax_code(item.get('taxRateId') or item.get('tax_rate_id'), line_vat)
+            tax_code = (
+                ReceiptService._tax_code(item.get('taxRateId') or item.get('tax_rate_id'), line_vat)
+                if is_vat_registered
+                else ''
+            )
+            formatted_line_total = f"{ReceiptService._format_money(line_total)}{f' {tax_code}' if tax_code else ''}"
             receipt_lines.append(
                 ReceiptService._format_pair(
                     f"{ReceiptService._format_quantity(quantity)} X {ReceiptService._format_money(unit_price)}",
-                    f"{ReceiptService._format_money(line_total)} {tax_code}",
+                    formatted_line_total,
                 )
             )
             receipt_lines.append(ReceiptService._short_line(item.get('description') or item.get('name') or item.get('productCode')))
@@ -243,12 +248,13 @@ class ReceiptService:
                 )
 
         receipt_lines.append('-' * 40)
-        total_vat = Decimal('0')
-        for tax_row in tax_breakdown_rows:
-            total_vat += Decimal(str(tax_row.get('vat') or 0))
-            receipt_lines.append(ReceiptService._format_pair(f"TAXABLE {tax_row['label']}", ReceiptService._format_money(tax_row.get('taxable'))))
-            receipt_lines.append(ReceiptService._format_pair(f"VAT {tax_row['label']}", ReceiptService._format_money(tax_row.get('vat'))))
-        receipt_lines.append(ReceiptService._format_pair('TOTAL VAT:', ReceiptService._format_money(total_vat)))
+        if is_vat_registered:
+            total_vat = Decimal('0')
+            for tax_row in tax_breakdown_rows:
+                total_vat += Decimal(str(tax_row.get('vat') or 0))
+                receipt_lines.append(ReceiptService._format_pair(f"TAXABLE {tax_row['label']}", ReceiptService._format_money(tax_row.get('taxable'))))
+                receipt_lines.append(ReceiptService._format_pair(f"VAT {tax_row['label']}", ReceiptService._format_money(tax_row.get('vat'))))
+            receipt_lines.append(ReceiptService._format_pair('TOTAL VAT:', ReceiptService._format_money(total_vat)))
         for levy_row in summary.get('levyBreakDown') or []:
             if not isinstance(levy_row, dict):
                 continue

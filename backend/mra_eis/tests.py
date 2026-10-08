@@ -6754,7 +6754,7 @@ class ReceiptTests(TestCase):
         receipt = ReceiptService.generate_receipt(zero_invoice)
 
         self.assertIn('*VAT REGISTERED*', receipt.receipt_text)
-        self.assertNotIn('*NON VAT REGISTERED*', receipt.receipt_text)
+        self.assertNotIn('*NOT VAT REGISTERED*', receipt.receipt_text)
 
     def test_receipt_vat_label_uses_taxpayer_config_for_non_vat_sale_with_vat_amount(self):
         """Non-VAT taxpayer should not print VAT registered just because VAT exists on the invoice."""
@@ -6763,8 +6763,10 @@ class ReceiptTests(TestCase):
 
         receipt = ReceiptService.generate_receipt(self.invoice)
 
-        self.assertIn('*NON VAT REGISTERED*', receipt.receipt_text)
-        self.assertNotIn('*VAT REGISTERED*', receipt.receipt_text.replace('*NON VAT REGISTERED*', ''))
+        self.assertIn('*NOT VAT REGISTERED*', receipt.receipt_text)
+        self.assertNotIn('*VAT REGISTERED*', receipt.receipt_text.replace('*NOT VAT REGISTERED*', ''))
+        self.assertNotIn('TOTAL VAT:', receipt.receipt_text)
+        self.assertNotIn('VAT A-', receipt.receipt_text)
 
 
 class AuditLogTests(TestCase):

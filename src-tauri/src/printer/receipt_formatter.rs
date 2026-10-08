@@ -253,7 +253,9 @@ fn is_legal_receipt_end_marker(line: &str) -> bool {
 fn is_vat_registration_marker(line: &str) -> bool {
     let normalized = line.trim().trim_matches('*').trim().to_ascii_lowercase();
 
-    normalized == "vat registered" || normalized == "non vat registered"
+    normalized == "vat registered"
+        || normalized == "non vat registered"
+        || normalized == "not vat registered"
 }
 
 fn is_total_line(line: &str) -> bool {
@@ -1228,7 +1230,7 @@ mod tests {
     #[test]
     fn explicit_thermal_receipt_centers_markers_for_58mm_width() {
         let start = center_text("*** START OF LEGAL RECEIPT ***", COMPACT_RECEIPT_LINE_WIDTH);
-        let vat = center_text("*NON VAT REGISTERED*", COMPACT_RECEIPT_LINE_WIDTH);
+        let vat = center_text("*NOT VAT REGISTERED*", COMPACT_RECEIPT_LINE_WIDTH);
         let end = center_text("*** END OF LEGAL RECEIPT ***", COMPACT_RECEIPT_LINE_WIDTH);
         let thermal = format!("{start}\n{vat}\nTOTAL:             19350.00\n{end}");
         let encoded = urlencoding::encode(&thermal);
@@ -1240,7 +1242,7 @@ mod tests {
 
         for marker in [
             "*** START OF LEGAL RECEIPT ***",
-            "*NON VAT REGISTERED*",
+            "*NOT VAT REGISTERED*",
             "*** END OF LEGAL RECEIPT ***",
         ] {
             let marker_index = rendered
