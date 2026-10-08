@@ -1,6 +1,8 @@
 import { db, type Order, type Session, type InventoryItem, type PurchaseOrder, type TakeOrder } from '@/lib/db';
 import { authFetch } from '@/lib/auth-fetch';
 import { normalizePurchaseBatchQuantities } from '@/lib/purchase-quantity';
+import { removeRejectedSaleLocally } from '@/lib/services/sales-service';
+import { isEisSaleNotCreated } from '@/lib/eis-submission';
 
 interface SyncChange {
   id: string;
@@ -32,6 +34,7 @@ class SyncService {
   };
 
   private syncInProgress = false;
+  private syncCompletionWaiters: Array<() => void> = [];
   private readonly INVENTORY_SYNC_KEY = 'inventory_last_synced_at';
   private readonly SALES_STORAGE_KEY = 'handypos-sales';
   private readonly PENDING_SALES_KEY = 'handypos-pending-sales';
@@ -400,8 +403,11 @@ class SyncService {
     }
 
     if (this.syncInProgress) {
-      console.log('[Sync] Sync already in progress, skipping');
-      return;
+      console.log('[Sync] Sync already in progress; waiting before starting this sync');
+      await new Promise<void>((resolve) => {
+        this.syncCompletionWaiters.push(resolve);
+      });
+      return this.performFullSync(branchId, options);
     }
 
     this.syncInProgress = true;
@@ -439,6 +445,8 @@ class SyncService {
     } finally {
       this.syncInProgress = false;
       this.syncState.is_syncing = false;
+      const waiters = this.syncCompletionWaiters.splice(0);
+      waiters.forEach((resolve) => resolve());
     }
   }
 
@@ -468,7 +476,7 @@ class SyncService {
       const orderChanges = changes.filter(c => c.entity_type === 'Order');
       const expenseChanges = changes.filter(c => c.entity_type === 'Expense');
       const taxChanges = changes.filter(c => c.entity_type === 'TaxRate');
-      const inventoryChanges = changes.filter(c =>
+      let inventoryChanges = changes.filter(c =>
         c.entity_type !== 'TakeOrder' &&
         c.entity_type !== 'Session' &&
         c.entity_type !== 'Order' &&
@@ -543,7 +551,7 @@ class SyncService {
           // successful order acknowledgement can cause stock drift/out-of-order updates.
           if (errors.length > 0 || acknowledged.length < orderChanges.length) {
             hasBlockingOrderSyncIssue = true;
-            console.warn('[Sync] Order sync incomplete; skipping inventory push for this cycle.');
+            console.warn('[Sync] Order sync incomplete; deferring stock-changing inventory updates for this cycle.');
           }
         } catch (error) {
           console.error('[Sync] Order push failed:', error);
@@ -552,7 +560,21 @@ class SyncService {
       }
 
       if (hasBlockingOrderSyncIssue) {
-        return;
+        const deletionChanges = inventoryChanges.filter((change) => (
+          change.entity_type === 'InventoryItem' && change.op === 'delete'
+        ));
+
+        if (deletionChanges.length === 0) {
+          return;
+        }
+
+        // A blocked sale must not prevent cleanup of an independently deleted
+        // inventory row. Stock-changing updates remain deferred for ordering
+        // safety, but deletes can be safely sent on their own.
+        console.warn(
+          `[Sync] Order sync incomplete; pushing ${deletionChanges.length} inventory deletion(s) only.`
+        );
+        inventoryChanges = deletionChanges;
       }
 
       // Push inventory changes to inventory sync endpoint
@@ -930,6 +952,12 @@ class SyncService {
 
     const diagnostic = this.getMraSubmissionDiagnostic(errorItem);
     const existingOrder = await db.orders.get(id);
+    if (isEisSaleNotCreated(errorItem)) {
+      await removeRejectedSaleLocally(id, message);
+      this.removeQueuedRequestsForEntity('Order', id);
+      return;
+    }
+
     const existingMetadata =
       existingOrder?.eisValidationMetadata ||
       existingOrder?.eis_validation_metadata ||
@@ -1357,7 +1385,9 @@ class SyncService {
         .toArray();
 
       for (const item of inventoryItems) {
-        if (item._dirty && (item as any).syncRetryBlocked !== true) {
+        // A deletion must remain deliverable even if an earlier rejected sale
+        // marked the same row as retry-blocked.
+        if (item._dirty && ((item as any).syncRetryBlocked !== true || item._operation === 'delete')) {
           changes.push({
             id: item.id,
             entity_type: 'InventoryItem',
@@ -1368,7 +1398,7 @@ class SyncService {
         }
       }
 
-      console.log(`[Sync] Collected ${inventoryItems.filter(i => i._dirty && (i as any).syncRetryBlocked !== true).length} dirty inventory items`);
+      console.log(`[Sync] Collected ${inventoryItems.filter(i => i._dirty && ((i as any).syncRetryBlocked !== true || i._operation === 'delete')).length} dirty inventory items`);
 
       // Collect from suppliers (ensure suppliers sync before purchase orders)
       const suppliers = await db.suppliers.toArray();
@@ -1835,6 +1865,11 @@ class SyncService {
       const mraFailureMessage = mraIncomplete
         ? this.getMraSubmissionFailureMessage(normalizedAck)
         : '';
+      if (isEisSaleNotCreated(normalizedAck)) {
+        await removeRejectedSaleLocally(id, mraFailureMessage || 'MRA rejected the fiscal sale.');
+        this.removeQueuedRequestsForEntity('Order', id);
+        return;
+      }
       const updatePayload: any = {
         _dirty: false,
         _operation: undefined,

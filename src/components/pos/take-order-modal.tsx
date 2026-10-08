@@ -168,7 +168,7 @@ export function TakeOrderModal({ branchId, isOpen, onOpenChange }: TakeOrderModa
             };
 
             // Send to backend API
-            console.log('[TakeOrderModal] Sending payload:', payload);
+
             const createdOrder = await authFetch.fetch('/orders/take-orders/', {
                 method: 'POST',
                 headers: {
@@ -177,7 +177,7 @@ export function TakeOrderModal({ branchId, isOpen, onOpenChange }: TakeOrderModa
                 body: JSON.stringify(payload),
             });
 
-            console.log('[TakeOrderModal] Response from backend:', createdOrder);
+
             
             if (!createdOrder || !createdOrder.id) {
                 console.error('[TakeOrderModal] Invalid response structure:', createdOrder);

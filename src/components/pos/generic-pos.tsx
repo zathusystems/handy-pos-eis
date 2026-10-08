@@ -18,6 +18,7 @@ import {
   Printer,
   Wifi,
   WifiOff,
+  Download,
 } from 'lucide-react';
 import type { CartItem, PaymentMethod } from '@/app/dashboard/pos/page';
 import type { InventoryItem, Order, TaxRate } from '@/lib/db';
@@ -60,7 +61,7 @@ import {
 import { getNextReceiptCopyNumber, markReceiptPrinted } from '@/lib/services/receipt-copy-service';
 import { safeLocalStorageGetItem } from '@/lib/safe-local-storage';
 import { formatInventoryQuantity } from '@/lib/quantity-format';
-
+import { exportThermalReceiptPdf } from '@/lib/thermal-receipt-pdf';
 
 export type BuyerDetails = {
   name?: string;
@@ -1319,9 +1320,9 @@ const PaymentDialog = ({
             const effectiveTaxLabel = shouldUseEisTaxMappings
                 ? 'VAT Amount'
                 : taxLabel;
-            console.log('[PaymentDialog] Starting tax calculation, cart items:', cart?.length);
+
             if (!cart || cart.length === 0) {
-                console.log('[PaymentDialog] No cart items, using default tax:', tax);
+
                 if (!cancelled) {
                     setCalculatedTax(tax);
                     setCalculatedNetAmount(subtotal);
@@ -1620,7 +1621,7 @@ const PaymentDialog = ({
                             itemNet = lineAmount;
                             itemGross = lineAmount;
                             taxCalculationBasis = 'not_applicable';
-                            console.log(`[PaymentDialog] ✓ Product ${cartItem.name} is ${taxType.toUpperCase()} - no tax applied`);
+
                         } else {
                             taxCalculationMethod = resolveMappingTaxMethod(localMapping);
                             const effectiveTaxRate = normalizedRate / 100;
@@ -1630,7 +1631,7 @@ const PaymentDialog = ({
                                 itemNet = lineAmount;
                                 itemGross = lineAmount + itemTax;
                                 taxCalculationBasis = 'net_exclusive';
-                                console.log(`[PaymentDialog] ✓ Using EXCLUSIVE tax for ${cartItem.name}: ${normalizedRate}% (added tax: ${itemTax})`);
+
                             } else {
                                 itemTax = effectiveTaxRate > 0
                                     ? lineAmount * effectiveTaxRate / (1 + effectiveTaxRate)
@@ -1638,7 +1639,7 @@ const PaymentDialog = ({
                                 itemGross = lineAmount;
                                 itemNet = lineAmount - itemTax;
                                 taxCalculationBasis = 'gross_inclusive';
-                                console.log(`[PaymentDialog] ✓ Using INCLUSIVE tax for ${cartItem.name}: ${normalizedRate}% (extracted tax: ${itemTax})`);
+
                             }
                         }
                         
@@ -1669,7 +1670,7 @@ const PaymentDialog = ({
                         const hasLocalMapping = Boolean(localMapping);
                         const mappingStatus: MappingStatus = hasLocalMapping ? 'pending' : 'unmapped';
                         const reasonSuffix = hasLocalMapping ? ' (mapping pending approval/sync)' : '';
-                        console.log(`[PaymentDialog] ✗ Mapping not ready for ${cartItem.name}${reasonSuffix}`);
+
                         if (shouldEnforceTaxMapping) {
                             unmapped.push(`${cartItem.name}${reasonSuffix}`);
                         }
@@ -1789,10 +1790,7 @@ const PaymentDialog = ({
                         }
                     }
                 }
-                console.log('[PaymentDialog] FINAL CALCULATED TAX:', totalTax);
-                console.log('[PaymentDialog] FINAL NET/GROSS:', { totalNet, totalGross });
-                console.log('[PaymentDialog] Tax breakdown by product:', mappings);
-                console.log('[PaymentDialog] Unmapped products:', unmapped);
+
                 if (!cancelled) {
                     setCalculatedTax(totalTax);
                     setCalculatedNetAmount(totalNet);
@@ -2094,6 +2092,7 @@ const PaymentDialog = ({
     const [isAutoPrintRunning, setIsAutoPrintRunning] = useState(false);
     const [isReceiptPreviewOpen, setIsReceiptPreviewOpen] = useState(false);
     const [isPreparingReceiptPreview, setIsPreparingReceiptPreview] = useState(false);
+    const [isExportingReceiptPdf, setIsExportingReceiptPdf] = useState(false);
     const [hasDefaultPrinter, setHasDefaultPrinter] = useState<boolean | null>(null);
     const [receiptPaperWidth, setReceiptPaperWidth] = useState<PrinterPaperWidth>('80mm');
     const [receiptDisplaySettings, setReceiptDisplaySettings] = useState<ReceiptDisplaySettings>(DEFAULT_RECEIPT_DISPLAY_SETTINGS);
@@ -2238,7 +2237,7 @@ const PaymentDialog = ({
 
     const handlePrintReceipt = useCallback(async (): Promise<boolean> => {
         if (printJobLockRef.current) {
-            console.log('[Print] Print job already running, skipping duplicate trigger');
+
             return false;
         }
 
@@ -2330,7 +2329,6 @@ const PaymentDialog = ({
 
             // Try silent printing first (works with Tauri/Electron or auto-submit)
             const availableMethods = silentPrintService.getAvailableMethods();
-            console.log('[Print] Available print methods:', availableMethods);
 
             let printedCopies = 0;
             let failedResult: { timedOut: boolean; message?: string } | null = null;
@@ -2488,6 +2486,70 @@ const PaymentDialog = ({
             setIsPreparingReceiptPreview(false);
         }
     }, [activeBranchId, applyPrinterSettingsToReceipt, completedOrder, eisEnabled, toast, waitForFiscalReceiptData]);
+
+    const handleExportReceiptPdf = useCallback(async () => {
+        const activeOrder = completedOrder as Order | null;
+        if (!activeOrder) {
+            toast({
+                variant: 'destructive',
+                title: 'PDF Export Failed',
+                description: 'No completed order found to export.',
+            });
+            return;
+        }
+
+        try {
+            setIsExportingReceiptPdf(true);
+            let receiptOrder = activeOrder;
+            if (eisEnabled && !hasFiscalReceiptPrintData(receiptOrder)) {
+                receiptOrder = await waitForFiscalReceiptData(receiptOrder, 45000);
+                if (!hasFiscalReceiptPrintData(receiptOrder)) {
+                    toast({
+                        variant: isOfflineQueuedReceipt(receiptOrder) ? 'default' : 'destructive',
+                        title: isOfflineQueuedReceipt(receiptOrder) ? 'Offline Receipt Queued' : 'Receipt Not Ready',
+                        description: isOfflineQueuedReceipt(receiptOrder)
+                            ? 'The receipt is queued for backend replay.'
+                            : 'The fiscal receipt is not ready yet.',
+                    });
+                    return;
+                }
+                setCompletedOrder(receiptOrder);
+            }
+
+            setReceiptCopyNumber(1);
+            await new Promise((resolve) => setTimeout(resolve, 120));
+            const elementId = document.getElementById('mra-receipt-preview-area')
+                ? 'mra-receipt-preview-area'
+                : 'receipt-printable-area';
+            const orderNumber = String(
+                (receiptOrder as any).fiscalInvoiceNumber ??
+                (receiptOrder as any).fiscal_invoice_number ??
+                (receiptOrder as any).orderNumber ??
+                (receiptOrder as any).order_number ??
+                'receipt'
+            ).trim();
+            const result = await exportThermalReceiptPdf({
+                elementId,
+                paperWidth: receiptPaperWidth,
+                filename: `handypos-receipt-${orderNumber}`,
+            });
+            toast({
+                title: 'Receipt PDF Exported',
+                description: result.location === 'tauri'
+                    ? `Saved to ${result.path}`
+                    : `${result.filename} downloaded.`,
+            });
+        } catch (error) {
+            console.error('[Receipt PDF] Export failed:', error);
+            toast({
+                variant: 'destructive',
+                title: 'PDF Export Failed',
+                description: 'Could not export the thermal receipt PDF.',
+            });
+        } finally {
+            setIsExportingReceiptPdf(false);
+        }
+    }, [completedOrder, eisEnabled, receiptPaperWidth, toast, waitForFiscalReceiptData]);
 
     useEffect(() => {
         if (step !== 'confirmation' || !completedOrder || autoPrintHandled) {
@@ -2777,6 +2839,14 @@ const PaymentDialog = ({
                             <Button className="w-full sm:w-auto" variant="outline" onClick={() => setIsReceiptPreviewOpen(false)}>
                                 Close
                             </Button>
+                            <Button className="w-full sm:w-auto" variant="secondary" onClick={handleExportReceiptPdf} disabled={isExportingReceiptPdf || isPrintBusy}>
+                                {isExportingReceiptPdf ? (
+                                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                ) : (
+                                    <Download className="mr-2 h-4 w-4" />
+                                )}
+                                {isExportingReceiptPdf ? 'Exporting...' : 'Export PDF'}
+                            </Button>
                             <Button className="w-full sm:w-auto" onClick={handlePrintReceipt} disabled={isPrintBusy || hasDefaultPrinter === false || isEisReceiptPrintBlocked}>
                                 {isPrintBusy ? (
                                     <>
@@ -2816,6 +2886,19 @@ const PaymentDialog = ({
                             )}
                         </Button>
                     )}
+                    <Button
+                        className="w-full sm:w-auto"
+                        variant="secondary"
+                        onClick={handleExportReceiptPdf}
+                        disabled={isExportingReceiptPdf || isPrintBusy}
+                    >
+                        {isExportingReceiptPdf ? (
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        ) : (
+                            <Download className="mr-2 h-4 w-4" />
+                        )}
+                        {isExportingReceiptPdf ? 'Exporting...' : 'Export PDF'}
+                    </Button>
                     {hasDefaultPrinter === false && (
                         <Button className="w-full sm:w-auto" variant="secondary" onClick={onConfigurePrinter} disabled={isPrintBusy}>
                             <Printer className="mr-2 h-4 w-4" />
@@ -3157,39 +3240,6 @@ export const GenericPos = ({
     };
   }, [branchId]);
 
-  // Log all MRA mappings and their status for debugging
-  useEffect(() => {
-    if (mraMappings && mraMappings.length > 0) {
-      console.log('[POS] ========== LOCAL DB MRA MAPPINGS STATUS ==========');
-      console.log(`[POS] Total mappings in local DB: ${mraMappings.length}`);
-      
-      mraMappings.forEach((mapping, index) => {
-        console.log(`[POS] Mapping ${index + 1}:`);
-        console.log(`  - ID: ${mapping.id}`);
-        console.log(`  - Product ID: ${mapping.inventoryItemId}`);
-        console.log(`  - Product Name: ${mapping.mraProductName}`);
-        console.log(`  - MRA Code: ${mapping.mraProductCode}`);
-        console.log(`  - Is Approved: ${mapping.isApproved}`);
-        console.log(`  - MRA Synced: ${mapping.mraSynced}`);
-        console.log(`  - Tax Type: ${mapping.mraTaxType}`);
-        console.log(`  - Tax Rate: ${mapping.mraTaxRate}%`);
-        console.log(`  - Valid for Sale: ${mapping.isApproved && mapping.mraSynced ? '✓ YES' : '✗ NO'}`);
-      });
-      
-      const approved = mraMappings.filter(m => m.isApproved).length;
-      const synced = mraMappings.filter(m => m.mraSynced).length;
-      const valid = mraMappings.filter(m => m.isApproved && m.mraSynced).length;
-      
-      console.log(`[POS] ========== SUMMARY ==========`);
-      console.log(`[POS] Approved: ${approved}/${mraMappings.length}`);
-      console.log(`[POS] Synced: ${synced}/${mraMappings.length}`);
-      console.log(`[POS] Valid for Sale: ${valid}/${mraMappings.length}`);
-      console.log(`[POS] ====================================`);
-    } else {
-      console.log('[POS] No MRA mappings found in local database');
-    }
-  }, [mraMappings]);
-
   const mappingByItemId = useMemo(() => {
     const shouldScopeByBranch =
       Boolean(normalizedActiveBranchId) &&
@@ -3410,24 +3460,15 @@ export const GenericPos = ({
     const status = getMRAMappingStatus(itemId);
 
     if (!status.hasMapping) {
-      console.log(`[POS] Product ${itemId} has NO MRA mapping`);
+
       return false;
     }
 
     if (!status.isValid) {
-      console.log(`[POS] Product ${itemId} mapping found but NOT valid:`, {
-        isApproved: status.isApproved,
-        mraSynced: status.isSynced,
-        reason: !status.isApproved ? 'Not approved' : 'Not synced'
-      });
+
       return false;
     }
 
-    console.log(`[POS] Product ${itemId} has VALID MRA mapping:`, {
-      mraProductCode: status.mapping?.mraProductCode || status.mapping?.mra_product_code,
-      isApproved: status.isApproved,
-      mraSynced: status.isSynced
-    });
     return true;
   };
 

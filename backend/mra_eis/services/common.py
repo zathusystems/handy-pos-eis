@@ -16,12 +16,14 @@ class MRAIntegrationError(Exception):
         endpoint: str | None = None,
         endpoint_key: str | None = None,
         response_data: dict[str, Any] | None = None,
+        reason: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.endpoint = endpoint
         self.endpoint_key = endpoint_key
         self.response_data = response_data
+        self.reason = reason
 
 
 @dataclass

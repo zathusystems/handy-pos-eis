@@ -832,6 +832,7 @@ CELERY_TIMEZONE = TIME_ZONE
 # Optional: periodic EIS background processing (Celery beat)
 MRA_EIS_SYNC_INTERVAL_MINUTES = int(os.getenv('MRA_EIS_SYNC_INTERVAL_MINUTES', '5'))
 MRA_EIS_RETRY_INTERVAL_MINUTES = int(os.getenv('MRA_EIS_RETRY_INTERVAL_MINUTES', '2'))
+MRA_EIS_UNBLOCK_CHECK_INTERVAL_MINUTES = max(1, int(os.getenv('MRA_EIS_UNBLOCK_CHECK_INTERVAL_MINUTES', '5')))
 MRA_EIS_SYNC_ALL_ACTIVE_TERMINALS = os.getenv(
     'MRA_EIS_SYNC_ALL_ACTIVE_TERMINALS',
     'True',
@@ -846,6 +847,10 @@ if crontab:
         'mra-eis-process-retry-queue': {
             'task': 'mra_eis.tasks.process_mra_retry_queue',
             'schedule': crontab(minute=f'*/{MRA_EIS_RETRY_INTERVAL_MINUTES}'),
+        },
+        'mra-eis-check-suspended-terminal-unblocks': {
+            'task': 'mra_eis.tasks.check_suspended_terminal_unblock_status',
+            'schedule': crontab(minute=f'*/{MRA_EIS_UNBLOCK_CHECK_INTERVAL_MINUTES}'),
         },
     }
 

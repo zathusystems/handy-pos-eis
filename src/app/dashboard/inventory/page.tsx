@@ -23,6 +23,7 @@ import {
   refreshInventoryFromMraApprovedProducts,
   getInventorySyncStatus,
   markInventorySynced,
+  formatMraProductSyncDiagnostics,
 } from '@/lib/services/inventory-sync';
 import { toast } from '@/hooks/use-toast';
 import { authFetch } from '@/lib/auth-fetch';
@@ -320,23 +321,13 @@ export default function InventoryPage() {
         setActiveBranchId(branchId);
         if (isWarehouseBranchId(branchId)) {
           setActiveTab('inventory');
-          return;
         }
-        pullServerData(branchId);
       }
     };
 
     window.addEventListener('branchChanged', handleBranchChange);
     return () => window.removeEventListener('branchChanged', handleBranchChange);
   }, []);
-
-  // Pull server data on page load and when business context changes
-  useEffect(() => {
-    if (activeBranchId && !isWarehouseBranchId(activeBranchId)) {
-      console.log('[InventoryPage] Pulling server data for branch:', activeBranchId);
-      pullServerData(activeBranchId);
-    }
-  }, [activeBranchId, activeBusinessId]);
 
   const pullServerData = async (branchId: string) => {
     if (isWarehouseBranchId(branchId)) {
@@ -901,6 +892,14 @@ export default function InventoryPage() {
             ? `Synced ${result.synced} products from MRA-approved catalog`
             : `Synced ${result.synced} products (${result.created} new, ${result.updated} updated)`,
         });
+        const syncDiagnostics = formatMraProductSyncDiagnostics(result);
+        if (syncDiagnostics) {
+          toast({
+            variant: 'destructive',
+            title: 'Some EIS products need attention',
+            description: syncDiagnostics,
+          });
+        }
         if ((result.stockReconciliationWarnings || []).length > 0) {
           const warningCount = result.stockReconciliationWarnings?.length || 0;
           toast({
@@ -1065,14 +1064,16 @@ export default function InventoryPage() {
   const wasteCountLabel = `(${wasteLogData.length} item${wasteLogData.length === 1 ? '' : 's'})`;
   const mraCountLabel = `(${mraMappingsData.length} item${mraMappingsData.length === 1 ? '' : 's'})`;
 
+  // Use one current-context load for branch changes. The branch-change event
+  // only updates state so a stale EIS-disabled closure cannot race this fetch.
   useEffect(() => {
-    if (!isEisEnabled || !activeBranchId || isWarehouseBranchId(activeBranchId)) {
+    if (!activeBranchId || isWarehouseBranchId(activeBranchId)) {
       return;
     }
 
-    console.log('[InventoryPage] EIS enabled, refreshing products from MRA for branch:', activeBranchId);
+    console.log('[InventoryPage] Pulling server data for branch:', activeBranchId, 'EIS enabled:', isEisEnabled);
     pullServerData(activeBranchId);
-  }, [isEisEnabled, activeBranchId]);
+  }, [isEisEnabled, activeBranchId, activeBusinessId]);
 
   useEffect(() => {
     if (!isDeleteAllInventoryOpen && !isDeletingAllInventory) {
@@ -1704,17 +1705,21 @@ export default function InventoryPage() {
                     currency={businessCurrency}
                   />
                 ) : (
-                <InventoryTab
-                    inventoryData={inventoryData}
-                    isMobile={isMobile}
-                    currentBusinessType={currentBusinessType}
-                    searchTerm={searchTerm}
-                    onAddItem={() => canManageInventory && setAddFormOpen(true)}
-                    onEditItem={handleEditItem}
-                    onImport={() => canManageInventory && setImportModalOpen(true)}
-                    onTransfer={() => canTransferInventory && setTransferStockOpen(true)}
-                    readOnly={!canManageInventory}
-                />
+                <>
+                  <InventoryTab
+                      inventoryData={inventoryData}
+                      isMobile={isMobile}
+                      currentBusinessType={currentBusinessType}
+                      searchTerm={searchTerm}
+                      onAddItem={() => canManageInventory && setAddFormOpen(true)}
+                      onEditItem={handleEditItem}
+                      onImport={() => canManageInventory && setImportModalOpen(true)}
+                      onTransfer={() => canTransferInventory && setTransferStockOpen(true)}
+                      onSyncEisProducts={isEisEnabled ? handleSyncFromBackend : undefined}
+                      isSyncingEisProducts={isSyncing}
+                      readOnly={!canManageInventory}
+                  />
+                </>
                 )}
             </TabsContent>
             {canManageInventory && (

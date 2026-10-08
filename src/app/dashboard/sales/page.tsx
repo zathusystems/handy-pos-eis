@@ -82,6 +82,9 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { db, type Order, type Refund, type OrderItem } from '@/lib/db';
+import {
+  resolveEisSaleStatusLabel,
+} from '@/lib/eis-submission';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useCurrency } from '@/hooks/use-currency';
@@ -983,11 +986,26 @@ export default function ReportsPage() {
                         <TableBody>
                             {!allOrders ? (
                                 <TableRow><TableCell colSpan={6} className="text-center"><Loader2 className="animate-spin mx-auto" /></TableCell></TableRow>
-                            ) : allOrders.map(order => (
+                            ) : allOrders.map(order => {
+                                const eisDisplayStatus = resolveEisSaleStatusLabel(order, isEisEnabled);
+                                const displayStatus = eisDisplayStatus || order.status;
+                                const displayStatusVariant = eisDisplayStatus === 'Fiscal Failed'
+                                    ? 'destructive'
+                                    : eisDisplayStatus === 'EIS Pending'
+                                        ? 'outline'
+                                        : eisDisplayStatus === 'EIS Submitted'
+                                            ? 'default'
+                                            : orderStatusBadge[order.status];
+
+                                return (
                                 <TableRow key={order.id} className={`${order.status === 'Voided' ? 'opacity-60' : ''}`}>
                                     <TableCell className="font-mono">#{order.orderNumber}</TableCell>
                                     <TableCell>{format(new Date(order.createdAt), 'PPpp')}</TableCell>
-                                    <TableCell><Badge variant={orderStatusBadge[order.status]}>{order.status}</Badge></TableCell>
+                                    <TableCell>
+                                        <div className="flex flex-col items-start gap-1">
+                                            <Badge variant={displayStatusVariant}>{displayStatus}</Badge>
+                                        </div>
+                                    </TableCell>
                                     <TableCell><Badge variant="outline">{order.paymentMethod}</Badge></TableCell>
                                     <TableCell className="text-right font-semibold">{formatCurrency(order.total)}</TableCell>
                                     <TableCell className="text-right">
@@ -1006,7 +1024,8 @@ export default function ReportsPage() {
                                         </DropdownMenu>
                                     </TableCell>
                                 </TableRow>
-                            ))}
+                                );
+                            })}
                         </TableBody>
                     </Table>
                 </CardContent>

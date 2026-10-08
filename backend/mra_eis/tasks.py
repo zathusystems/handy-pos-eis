@@ -10,7 +10,7 @@ from django.conf import settings
 from django.db.models import Q
 
 from .models import Terminal
-from .services import InvoiceService, RetryService
+from .services import InvoiceService, RetryService, TerminalService
 
 logger = logging.getLogger(__name__)
 
@@ -84,4 +84,74 @@ def sync_offline_invoices_for_online_terminals():
         'synced': synced_total,
         'failed': failed_total,
         'expired': expired_total,
+    }
+
+
+@shared_task
+def check_suspended_terminal_unblock_status():
+    """Ask MRA whether locally suspended terminals have been unblocked.
+
+    This is deliberately one sequential Celery task. It checks only terminals
+    already marked suspended locally, so normal active terminals do not create
+    MRA traffic and each terminal does not get its own worker process.
+    """
+    live_submission = (
+        bool(getattr(settings, 'MRA_EIS_ENABLE_HTTP_CALLS', False))
+        and not bool(getattr(settings, 'MRA_EIS_DRY_RUN', True))
+        and bool(getattr(settings, 'MRA_EIS_ALLOW_LIVE_SUBMISSION', False))
+    )
+    if not live_submission:
+        _print_replay('[MRA UNBLOCK TASK] skipped because live MRA submission is disabled')
+        return {
+            'terminals': 0,
+            'unblocked': 0,
+            'still_blocked': 0,
+            'failed': 0,
+            'skipped': True,
+        }
+
+    terminals = (
+        Terminal.objects
+        .filter(status='suspended')
+        .exclude(mra_token='')
+        .order_by('updated_at')
+    )
+    terminal_count = terminals.count()
+    unblocked_total = 0
+    still_blocked_total = 0
+    failed_total = 0
+
+    _print_replay(
+        f'[MRA UNBLOCK TASK] starting suspended_terminals={terminal_count}'
+    )
+
+    for terminal in terminals.iterator(chunk_size=50):
+        try:
+            result = TerminalService.check_terminal_unblock_status(terminal)
+            if result.get('is_unblocked') is True:
+                unblocked_total += 1
+                _print_replay(
+                    f'[MRA UNBLOCK TASK] terminal_id={terminal.terminal_id} unblocked'
+                )
+            else:
+                still_blocked_total += 1
+        except Exception as exc:
+            failed_total += 1
+            logger.exception(
+                '[MRA UNBLOCK TASK] terminal failed terminal_pk=%s terminal_id=%s error=%s',
+                terminal.pk,
+                terminal.terminal_id,
+                exc,
+            )
+
+    _print_replay(
+        f'[MRA UNBLOCK TASK] complete terminals={terminal_count} '
+        f'unblocked={unblocked_total} still_blocked={still_blocked_total} failed={failed_total}'
+    )
+    return {
+        'terminals': terminal_count,
+        'unblocked': unblocked_total,
+        'still_blocked': still_blocked_total,
+        'failed': failed_total,
+        'skipped': False,
     }

@@ -337,7 +337,11 @@ def _get_mra_submission_block_reason(mra_result):
         return 'MRA EIS submission did not return a valid response.'
 
     submission_message = str(mra_result.get('submission_message') or '').strip()
-    submission_state = str(mra_result.get('submission_state') or '').strip()
+    submission_state = str(mra_result.get('submission_state') or '').strip().lower()
+    eis_status = str(mra_result.get('eis_status') or '').strip().upper()
+    if submission_state == 'rejected' or eis_status == 'REJECTED':
+        return submission_message or 'MRA rejected the fiscal sale.'
+
     if submission_state in {'accepted', 'offline_queued'}:
         return None
 
@@ -361,13 +365,22 @@ def _get_mra_submission_block_reason(mra_result):
             return submission_message
         return f'MRA EIS unavailable ({reason}).'
 
-    eis_status = str(mra_result.get('eis_status') or '').upper()
     if eis_status != 'SUBMITTED':
         if submission_message:
             return submission_message
         return f'MRA EIS did not confirm submission (status: {eis_status or "UNKNOWN"}).'
 
     return None
+
+
+def _is_confirmed_mra_rejection(mra_result):
+    """Return True only when MRA explicitly rejected the fiscal sale."""
+    if not isinstance(mra_result, dict):
+        return False
+    return (
+        str(mra_result.get('submission_state') or '').strip().lower() == 'rejected'
+        or str(mra_result.get('eis_status') or '').strip().upper() == 'REJECTED'
+    )
 
 
 @api_view(['POST'])
@@ -880,10 +893,10 @@ def handle_create_order(order_id, data, business, branch_id, user, *, request_de
             getattr(business_settings, 'block_sales_if_tax_mapping_missing', False)
         )
 
-        # CRITICAL: Validate that ALL products have approved+synced MRA mappings
-        # Only enforce when block_sales_if_tax_mapping_missing is enabled.
+        # EIS tax is product-specific. Never use the generic local default when
+        # an approved+synced MRA mapping is missing.
         print(f"[Sync Sessions] Validating MRA mappings for order {order_id}")
-        if block_sales_if_tax_mapping_missing and data.get('items'):
+        if (eis_enabled or block_sales_if_tax_mapping_missing) and data.get('items'):
             unmapped_products = []
             unapproved_products = []
             unsynced_products = []
@@ -940,7 +953,14 @@ def handle_create_order(order_id, data, business, branch_id, user, *, request_de
                 print(f"[Sync Sessions] ✗ BLOCKED order creation - {error_msg}")
                 return {
                     'success': False,
-                    'error': error_msg
+                    'error': error_msg,
+                    'reason': 'eis_rejected',
+                    'mra_submission': {
+                        'state': 'rejected',
+                        'message': error_msg,
+                        'retryable': False,
+                        'eis_status': 'REJECTED',
+                    },
                 }
             
             if unapproved_products:
@@ -948,7 +968,14 @@ def handle_create_order(order_id, data, business, branch_id, user, *, request_de
                 print(f"[Sync Sessions] ✗ BLOCKED order creation - {error_msg}")
                 return {
                     'success': False,
-                    'error': error_msg
+                    'error': error_msg,
+                    'reason': 'eis_rejected',
+                    'mra_submission': {
+                        'state': 'rejected',
+                        'message': error_msg,
+                        'retryable': False,
+                        'eis_status': 'REJECTED',
+                    },
                 }
 
             if unsynced_products:
@@ -956,11 +983,18 @@ def handle_create_order(order_id, data, business, branch_id, user, *, request_de
                 print(f"[Sync Sessions] ✗ BLOCKED order creation - {error_msg}")
                 return {
                     'success': False,
-                    'error': error_msg
+                    'error': error_msg,
+                    'reason': 'eis_rejected',
+                    'mra_submission': {
+                        'state': 'rejected',
+                        'message': error_msg,
+                        'retryable': False,
+                        'eis_status': 'REJECTED',
+                    },
                 }
 
 
-        if block_sales_if_tax_mapping_missing:
+        if eis_enabled or block_sales_if_tax_mapping_missing:
             print(f"[Sync Sessions] ✓ All products have approved+synced MRA mappings - proceeding with order creation")
         else:
             print(f"[Sync Sessions] MRA mapping enforcement disabled - proceeding with order creation")
@@ -1106,9 +1140,10 @@ def handle_create_order(order_id, data, business, branch_id, user, *, request_de
                         )
 
                         if eis_enabled:
-                            fallback_tax_rate = Decimal('0')
-                            fallback_tax_type = 'standard'
-                            fallback_method = 'inclusive'
+                            return {
+                                'success': False,
+                                'error': f'Cannot create order: Product {item_data.get("name", item_id)} is missing an approved+synced MRA mapping.',
+                            }
                         elif not block_sales_if_tax_mapping_missing and fallback_tax_rate <= 0 and fallback_tax_type == 'standard' and default_tax_rate:
                             fallback_tax_rate = _to_decimal(default_tax_rate.rate, Decimal('0'))
                             fallback_tax_type = _normalize_tax_type(default_tax_rate.tax_type)
@@ -1147,9 +1182,10 @@ def handle_create_order(order_id, data, business, branch_id, user, *, request_de
                         item_data.get('taxType') or item_data.get('tax_type') or 'standard'
                     )
                     if eis_enabled:
-                        fallback_tax_rate = Decimal('0')
-                        fallback_tax_type = 'standard'
-                        fallback_method = 'inclusive'
+                        return {
+                            'success': False,
+                            'error': f'Cannot create order: Product {item_data.get("name", item_id)} is missing an approved+synced MRA mapping.',
+                        }
                     elif not block_sales_if_tax_mapping_missing and fallback_tax_rate <= 0 and fallback_tax_type == 'standard' and default_tax_rate:
                         fallback_tax_rate = _to_decimal(default_tax_rate.rate, Decimal('0'))
                         fallback_tax_type = _normalize_tax_type(default_tax_rate.tax_type)
@@ -1594,20 +1630,28 @@ def handle_create_order(order_id, data, business, branch_id, user, *, request_de
                     f"endpoint={mra_result.get('endpoint')} "
                     f"dry_run={mra_result.get('dry_run')} reason={mra_reason or 'none'}"
                 )
-                if _should_block_sales_if_eis_down(business_settings):
-                    block_reason = _get_mra_submission_block_reason(mra_result)
+                block_reason = _get_mra_submission_block_reason(mra_result)
+                confirmed_mra_rejection = _is_confirmed_mra_rejection(mra_result)
+                if confirmed_mra_rejection or (
+                    _should_block_sales_if_eis_down(business_settings) and block_reason
+                ):
                     if block_reason:
                         print(
                             f"[Sync Sessions] ✗ BLOCKED order {order_id}: "
-                            f"{block_reason} block_sales_if_eis_down is enabled."
+                            f"{block_reason}"
                         )
                         order.delete()
                         return {
                             'success': False,
                             'error': (
                                 f"{block_reason} "
-                                "Sale blocked by compliance policy (block_sales_if_eis_down)."
+                                + (
+                                    'Sale was not created in the POS because MRA rejected it.'
+                                    if confirmed_mra_rejection
+                                    else 'Sale blocked by compliance policy (block_sales_if_eis_down).'
+                                )
                             ),
+                            'reason': 'eis_rejected' if confirmed_mra_rejection else 'eis_submission_blocked',
                             'mra_submission': {
                                 'state': mra_result.get('submission_state') or 'unknown',
                                 'message': mra_result.get('submission_message') or block_reason,
@@ -1630,14 +1674,20 @@ def handle_create_order(order_id, data, business, branch_id, user, *, request_de
                 MRAIntegrationError = Exception
 
             if isinstance(mra_exc, MRAIntegrationError):
+                is_fiscal_rejection = str(getattr(mra_exc, 'reason', '') or '').strip().lower() == 'eis_rejected'
+                error_message = str(mra_exc)
+                if is_fiscal_rejection:
+                    error_message = f'{error_message} Sale was not created in the POS because EIS rejected it.'
                 order.delete()
                 return {
                     'success': False,
-                    'error': str(mra_exc),
+                    'error': error_message,
+                    'reason': 'eis_rejected' if is_fiscal_rejection else None,
                     'mra_submission': {
-                        'state': 'failed_before_submission',
-                        'message': str(mra_exc),
+                        'state': 'rejected' if is_fiscal_rejection else 'failed_before_submission',
+                        'message': error_message,
                         'retryable': False,
+                        'eis_status': 'REJECTED' if is_fiscal_rejection else '',
                     },
                 }
 

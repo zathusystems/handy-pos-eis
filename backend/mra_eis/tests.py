@@ -1415,6 +1415,56 @@ class TerminalBlockingComplianceTests(TransactionTestCase):
             mutating=False,
         )
 
+
+    @override_settings(
+        MRA_EIS_DRY_RUN=False,
+        MRA_EIS_ENABLE_HTTP_CALLS=True,
+        MRA_EIS_ALLOW_LIVE_SUBMISSION=True,
+    )
+    @patch.object(MRAEISClient, 'call')
+    def test_standalone_invoice_api_also_blocks_suspended_terminal(self, mock_call):
+        mock_call.return_value = MRACallResult(
+            ok=True,
+            dry_run=False,
+            status_code=200,
+            endpoint='/api/v1/utilities/get-terminal-blocking-message',
+            data={
+                'statusCode': 1,
+                'remark': 'Blocked',
+                'data': {
+                    'isBlocked': True,
+                    'blockingReason': 'Terminal blocked by MRA test condition',
+                },
+                'errors': [],
+            },
+        )
+
+        with self.assertRaisesMessage(MRAIntegrationError, 'MRA terminal is blocked'):
+            InvoiceService.create_invoice(
+                terminal=self.terminal,
+                seller_tin='70267581',
+                seller_name='Blocking Business',
+                items=[
+                    {
+                        'name': 'Amazon Big Candy',
+                        'quantity': 1,
+                        'unit_price': '250.00',
+                        'tax_category': 'zero',
+                        'tax_rate': '0.00',
+                    },
+                ],
+                is_online=True,
+            )
+
+        self.assertFalse(MRAInvoice.objects.filter(terminal=self.terminal).exists())
+        self.terminal.refresh_from_db()
+        self.assertEqual(self.terminal.status, 'suspended')
+        mock_call.assert_called_once_with(
+            'get_terminal_blocking_message',
+            payload={'terminalId': 'MRA-TERM-BLOCK-001'},
+            method='POST',
+            mutating=False,
+        )
     @override_settings(
         MRA_EIS_DRY_RUN=False,
         MRA_EIS_ENABLE_HTTP_CALLS=True,
@@ -1444,6 +1494,102 @@ class TerminalBlockingComplianceTests(TransactionTestCase):
         self.assertTrue(result['is_unblocked'])
         self.assertEqual(self.terminal.status, 'active')
         self.assertFalse(cached['is_blocked'])
+        mock_call.assert_called_once_with(
+            'check_terminal_unblock_status',
+            payload={'terminalId': 'MRA-TERM-BLOCK-001'},
+            method='POST',
+            mutating=False,
+        )
+
+    @override_settings(
+        MRA_EIS_DRY_RUN=False,
+        MRA_EIS_ENABLE_HTTP_CALLS=True,
+        MRA_EIS_ALLOW_LIVE_SUBMISSION=True,
+        MRA_EIS_REQUIRE_REMOTE_SEQUENCE_RECOVERY_FOR_SALES=False,
+    )
+    @patch.object(MRAEISClient, 'call')
+    def test_sale_automatically_rechecks_suspended_terminal_before_submission(self, mock_call):
+        order = self._create_ready_order()
+        self.terminal.status = 'suspended'
+        self.terminal.save(update_fields=['status', 'updated_at'])
+        calls = []
+
+        def response(endpoint, data):
+            return MRACallResult(
+                ok=True,
+                dry_run=False,
+                status_code=200,
+                endpoint=endpoint,
+                data=data,
+            )
+
+        responses = {
+            'check_terminal_unblock_status': response(
+                '/api/v1/utilities/check-terminal-unblock-status',
+                {'statusCode': 1, 'data': {'isUnblocked': True}, 'errors': []},
+            ),
+            'get_terminal_blocking_message': response(
+                '/api/v1/utilities/get-terminal-blocking-message',
+                {'statusCode': 1, 'data': {'isBlocked': False}, 'errors': []},
+            ),
+            'report_sale': response(
+                '/api/v1/sales/submit-sales-transaction',
+                {
+                    'statusCode': 1,
+                    'data': {'validationURL': 'https://validate.example/receipt'},
+                    'errors': [],
+                },
+            ),
+        }
+
+        def fake_call(endpoint_key, payload=None, **kwargs):
+            calls.append(endpoint_key)
+            return responses[endpoint_key]
+
+        mock_call.side_effect = fake_call
+
+        result = POSOrderSubmissionService.prepare_pos_order_submission(order, force_online=True)
+
+        self.terminal.refresh_from_db()
+        self.assertEqual(result['eis_status'], 'SUBMITTED')
+        self.assertEqual(self.terminal.status, 'active')
+        self.assertEqual(
+            calls,
+            ['check_terminal_unblock_status', 'get_terminal_blocking_message', 'report_sale'],
+        )
+
+    @override_settings(
+        MRA_EIS_DRY_RUN=False,
+        MRA_EIS_ENABLE_HTTP_CALLS=True,
+        MRA_EIS_ALLOW_LIVE_SUBMISSION=True,
+    )
+    @patch.object(MRAEISClient, 'call')
+    def test_unblock_task_reactivates_suspended_terminal(self, mock_call):
+        self.terminal.status = 'suspended'
+        self.terminal.save(update_fields=['status', 'updated_at'])
+        mock_call.return_value = MRACallResult(
+            ok=True,
+            dry_run=False,
+            status_code=200,
+            endpoint='/api/v1/utilities/check-terminal-unblock-status',
+            data={
+                'statusCode': 1,
+                'data': {'isUnblocked': True},
+                'errors': [],
+            },
+        )
+
+        from mra_eis.tasks import check_suspended_terminal_unblock_status
+
+        result = check_suspended_terminal_unblock_status.run()
+
+        self.terminal.refresh_from_db()
+        self.assertEqual(result['terminals'], 1)
+        self.assertEqual(result['unblocked'], 1)
+        self.assertEqual(result['still_blocked'], 0)
+        self.assertEqual(result['failed'], 0)
+        self.assertFalse(result['skipped'])
+        self.assertEqual(self.terminal.status, 'active')
         mock_call.assert_called_once_with(
             'check_terminal_unblock_status',
             payload={'terminalId': 'MRA-TERM-BLOCK-001'},
@@ -5285,6 +5431,56 @@ class POSOfflineComplianceTests(TransactionTestCase):
         self.assertEqual(product['tax_type'], 'standard')
         self.assertEqual(product['tax_rate'], Decimal('17.50'))
         self.assertFalse(product['tax_adjusted_for_non_vat'])
+
+    def test_catalog_tax_rate_id_uses_latest_mra_configuration_rate(self):
+        """A product tax-rate ID must resolve from the downloaded MRA config, not 16.5%."""
+        self._create_fresh_sales_configurations(
+            global_configuration={
+                'versionNo': 2,
+                'taxRates': [
+                    {'id': 'A', 'name': 'Standard Rated', 'rate': 12.5},
+                    {'id': 'B', 'name': 'Zero Rated', 'rate': 0},
+                ],
+            },
+            taxpayer_configuration={
+                'versionNo': 2,
+                'tin': '70267581',
+                'isVATRegistered': True,
+                'activatedTaxRateIds': ['A', 'B'],
+            },
+        )
+
+        product = ProductMappingService._normalize_mra_catalog_product(
+            {
+                'productCode': 'MRA-RATE-ID-001',
+                'productName': 'Rate ID Product',
+                'taxRateId': 'A',
+                'taxType': 'standard',
+                'isActive': True,
+            },
+            business=self.business,
+        )
+
+        self.assertIsNotNone(product)
+        self.assertEqual(product['tax_rate'], Decimal('12.50'))
+        self.assertTrue(product['tax_data_complete'])
+
+    def test_catalog_explicit_zero_rate_is_preserved(self):
+        """An explicit zero rate must never be replaced by the standard default."""
+        product = ProductMappingService._normalize_mra_catalog_product(
+            {
+                'productCode': 'MRA-ZERO-001',
+                'productName': 'Zero Rated Product',
+                'taxRate': 0,
+                'taxType': 'zero',
+                'isActive': True,
+            },
+            business=self.business,
+        )
+
+        self.assertIsNotNone(product)
+        self.assertEqual(product['tax_rate'], Decimal('0.00'))
+        self.assertTrue(product['tax_data_complete'])
 
     def test_sale_payload_rejects_local_tax_that_differs_from_mra_site_catalog(self):
         """A local zero override must not submit when EIS still configures the product as standard VAT."""

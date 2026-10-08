@@ -88,6 +88,7 @@ const mapBackendOrderToLocal = (
   );
   const eisUuid = toOptionalString(order?.eis_uuid ?? order?.eisUuid);
   const eisStatus = toOptionalString(order?.eis_status ?? order?.eisStatus) as Order['eisStatus'];
+  const eisSyncState = toOptionalString(order?.eis_sync_state ?? order?.eisSyncState);
   const eisSubmittedAt = toOptionalString(
     order?.eis_submitted_at ?? order?.eisSubmittedAt
   );
@@ -95,6 +96,13 @@ const mapBackendOrderToLocal = (
   const digitalSignature = toOptionalString(
     order?.digital_signature ?? order?.digitalSignature
   );
+  const eisValidationMetadata =
+    order?.eis_validation_metadata ?? order?.eisValidationMetadata;
+  const mraSubmission =
+    order?.mra_submission ??
+    order?.mraSubmission ??
+    eisValidationMetadata?.mra_submission ??
+    eisValidationMetadata?.mraSubmission;
   const isFiscalLocked = Boolean(
     order?.is_fiscal_locked ?? order?.isFiscalLocked ?? false
   );
@@ -151,6 +159,12 @@ const mapBackendOrderToLocal = (
     eis_uuid: eisUuid,
     eisStatus,
     eis_status: eisStatus,
+    eisSyncState,
+    eis_sync_state: eisSyncState,
+    eisValidationMetadata,
+    eis_validation_metadata: eisValidationMetadata,
+    mraSubmission,
+    mra_submission: mraSubmission,
     eisSubmittedAt,
     eis_submitted_at: eisSubmittedAt,
     qrCodePayload,

@@ -4,12 +4,13 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient, APIRequestFactory, force_authenticate
 
 from business.models import Business, Branch, BusinessSettings
 from inventory.models import InventoryItem, MRAProductMapping, PurchaseOrder, PurchaseOrderItem
+from mra_eis.services import MRAIntegrationError
 from pos_sessions.correction_serializers import VoidTransactionSerializer
 from pos_sessions.correction_views import VoidTransactionViewSet
 from pos_sessions.models import Order, OrderItem, Session, VoidTransaction
@@ -775,6 +776,228 @@ class SyncPushOrderTests(TestCase):
         self.assertEqual(Order.objects.filter(id=order_id).count(), 0)
         self.assertTrue(response.data['results']['errors'])
         self.assertIn('unsynced MRA mappings', response.data['results']['errors'][0]['error'])
+
+    def test_sync_push_eis_requires_mapping_even_when_mapping_block_setting_is_disabled(self):
+        BusinessSettings.objects.filter(business=self.business).update(
+            enable_eis=True,
+            block_sales_if_tax_mapping_missing=False,
+        )
+        MRAProductMapping.objects.filter(
+            inventory_item=self.inventory_item,
+            branch=self.branch,
+        ).delete()
+
+        order_id = str(uuid.uuid4())
+        response = self.client.post(
+            '/sessions/sync/push/',
+            self._build_sync_payload(order_id),
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Order.objects.filter(id=order_id).count(), 0)
+        self.assertTrue(response.data['results']['errors'])
+        self.assertIn('without MRA mappings', response.data['results']['errors'][0]['error'])
+
+
+class MRARejectedSaleRollbackTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email='mra-rejection-owner@example.com',
+            password='test12345',
+        )
+        self.business = Business.objects.create(
+            owner=self.user,
+            name='MRA Rejection Test Business',
+        )
+        BusinessSettings.objects.create(
+            business=self.business,
+            enable_eis=True,
+            block_sales_if_eis_down=False,
+        )
+        self.branch = Branch.objects.create(
+            business=self.business,
+            name='Main Branch',
+            address='123 Main St',
+            city='Lilongwe',
+            country='Malawi',
+        )
+        self.session = Session.objects.create(
+            business=self.business,
+            branch=self.branch,
+            user=self.user,
+            status='active',
+            opening_float=Decimal('0.00'),
+            expected_cash=Decimal('0.00'),
+            total_sales=Decimal('0.00'),
+            started_at=timezone.now(),
+        )
+        self.inventory_item = InventoryItem.objects.create(
+            business=self.business,
+            branch=self.branch,
+            name='Tax Mismatch Product',
+            category='Goods',
+            item_type='sellable',
+            stock_units=Decimal('10.000'),
+            reorder_level=Decimal('1.000'),
+            cost=Decimal('3.00'),
+            price=Decimal('5.00'),
+            value=Decimal('30.00'),
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def _rejected_mra_result(self):
+        return {
+            'submission_state': 'rejected',
+            'submission_message': 'MRA rejected the sale because the product tax rate does not match.',
+            'eis_status': 'REJECTED',
+            'dry_run': False,
+            'endpoint': 'report_sale',
+            'retryable': False,
+            'errors': ['Product tax rate mismatch.'],
+            'response': {'reason': 'mra_validation_rejected'},
+        }
+
+    def _direct_order_payload(self, order_id=None):
+        return {
+            'id': order_id or str(uuid.uuid4()),
+            'branch': self.branch.id,
+            'session': str(self.session.id),
+            'orderNumber': 9301,
+            'orderType': 'sale',
+            'status': 'Completed',
+            'paymentMethod': 'Cash',
+            'subtotal': 5.0,
+            'total': 5.0,
+            'cogs': 3.0,
+            'items': [
+                {
+                    'id': str(uuid.uuid4()),
+                    'inventoryItemId': str(self.inventory_item.id),
+                    'name': self.inventory_item.name,
+                    'quantity': 1,
+                    'price': 5.0,
+                    'notes': '',
+                }
+            ],
+        }
+
+    @override_settings(MRA_EIS_IS_LIVE=True)
+    @patch('mra_eis.services.POSOrderSubmissionService.prepare_pos_order_submission')
+    def test_direct_order_is_rolled_back_when_mra_rejects_even_if_outage_block_is_disabled(self, mocked_prepare):
+        mocked_prepare.return_value = self._rejected_mra_result()
+
+        response = self.client.post(
+            '/sessions/orders/',
+            self._direct_order_payload(),
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data.get('reason'), 'eis_rejected')
+        self.assertFalse(Order.objects.filter(branch=self.branch).exists())
+        self.inventory_item.refresh_from_db()
+        self.assertEqual(self.inventory_item.stock_units, Decimal('10.000'))
+
+
+    @override_settings(MRA_EIS_IS_LIVE=True)
+    @patch('mra_eis.services.POSOrderSubmissionService.prepare_pos_order_submission')
+    def test_direct_order_is_rolled_back_when_submission_is_blocked(self, mocked_prepare):
+        BusinessSettings.objects.filter(business=self.business).update(
+            block_sales_if_eis_down=True,
+        )
+        mocked_prepare.return_value = {
+            'submission_state': 'prepared_retry',
+            'submission_message': 'MRA EIS is temporarily unavailable.',
+            'eis_status': '',
+            'dry_run': True,
+            'endpoint': 'report_sale',
+            'retryable': True,
+            'errors': [],
+            'response': {'reason': 'eis_unreachable'},
+        }
+
+        response = self.client.post(
+            '/sessions/orders/',
+            self._direct_order_payload(),
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data.get('reason'), 'eis_submission_blocked')
+        self.assertFalse(Order.objects.filter(branch=self.branch).exists())
+        self.inventory_item.refresh_from_db()
+        self.assertEqual(self.inventory_item.stock_units, Decimal('10.000'))
+
+    @override_settings(MRA_EIS_IS_LIVE=True)
+    @patch('mra_eis.services.POSOrderSubmissionService.prepare_pos_order_submission')
+    def test_direct_order_marks_tax_catalog_mismatch_as_fiscal_rejection(self, mocked_prepare):
+        mocked_prepare.side_effect = MRAIntegrationError(
+            'MRA site product "2908775519001" is configured in EIS as standard VAT (20.00%), '
+            'but the local POS mapping is standard VAT (16.50%).',
+            reason='eis_rejected',
+        )
+
+        response = self.client.post(
+            '/sessions/orders/',
+            self._direct_order_payload(),
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data.get('reason'), 'eis_rejected')
+        self.assertEqual(response.data.get('eis_status'), 'REJECTED')
+        self.assertEqual(response.data['mra_submission']['state'], 'rejected')
+        self.assertFalse(Order.objects.filter(branch=self.branch).exists())
+        self.inventory_item.refresh_from_db()
+        self.assertEqual(self.inventory_item.stock_units, Decimal('10.000'))
+
+    @override_settings(MRA_EIS_IS_LIVE=True)
+    @patch('mra_eis.services.POSOrderSubmissionService.prepare_pos_order_submission')
+    def test_sync_order_is_deleted_when_mra_rejects(self, mocked_prepare):
+        mocked_prepare.return_value = self._rejected_mra_result()
+        order_id = str(uuid.uuid4())
+        now = timezone.now().isoformat()
+        payload = {
+            'last_synced_at': now,
+            'branch_id': str(self.branch.id),
+            'changes': [
+                {
+                    'id': order_id,
+                    'entity_type': 'Order',
+                    'op': 'create',
+                    'timestamp': now,
+                    'data': {
+                        'id': order_id,
+                        'orderNumber': 9302,
+                        'orderType': 'sale',
+                        'status': 'Completed',
+                        'paymentMethod': 'Cash',
+                        'subtotal': 5.0,
+                        'total': 5.0,
+                        'cogs': 3.0,
+                        'sessionId': str(self.session.id),
+                        'items': [
+                            {
+                                'id': str(uuid.uuid4()),
+                                'inventoryItemId': str(self.inventory_item.id),
+                                'name': self.inventory_item.name,
+                                'quantity': 1,
+                                'price': 5.0,
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+
+        response = self.client.post('/sessions/sync/push/', payload, format='json')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Order.objects.filter(id=order_id).exists())
+        self.assertEqual(response.data['results']['acknowledged'], [])
+        self.assertEqual(response.data['results']['errors'][0].get('reason'), 'eis_rejected')
 
 
 class SessionVisibilityTests(TestCase):

@@ -9,6 +9,9 @@ import { format } from 'date-fns';
 import { v4 as uuidv4 } from 'uuid';
 
 import { db, type Session, type InventoryItem, type StockRecord, type Order } from '@/lib/db';
+import {
+  resolveEisSaleStatusLabel,
+} from '@/lib/eis-submission';
 import { useAuth } from '@/hooks/use-auth';
 import { useCurrency } from '@/hooks/use-currency';
 import { Button } from '@/components/ui/button';
@@ -304,12 +307,6 @@ const resolveBuyerDetails = (order: Order | null | undefined) => {
     };
 };
 
-const resolveEisStatus = (order: Order | null | undefined): string => {
-    const source = order as any;
-    const status = toTrimmedString(source?.eisStatus ?? source?.eis_status);
-    return status ? status.toUpperCase() : '';
-};
-
 const sortOrdersByMostRecent = (orders: Order[]): Order[] => {
     return [...orders].sort((a, b) => {
         const timeA = Date.parse(String((a as any)?.createdAt ?? (a as any)?.created_at ?? ''));
@@ -456,8 +453,15 @@ const SessionSalesList = ({ sessionId }: { sessionId: string }) => {
                 {orderedSessionSales.map((order) => {
                   const buyerDetails = resolveBuyerDetails(order);
                   const buyerName = buyerDetails.name || 'Walk-in';
-                  const eisStatus = resolveEisStatus(order);
-                  const isEisPending = eisStatus === 'PENDING' || (!eisStatus && Boolean((order as any)?._dirty));
+                  const eisDisplayStatus = resolveEisSaleStatusLabel(order, true);
+                  const displayStatus = eisDisplayStatus || order.status;
+                  const displayStatusVariant = eisDisplayStatus === 'Fiscal Failed'
+                    ? 'destructive'
+                    : eisDisplayStatus === 'EIS Pending'
+                      ? 'outline'
+                      : eisDisplayStatus === 'EIS Submitted'
+                        ? 'default'
+                        : orderStatusBadge[order.status];
                   const createdAt = new Date(order.createdAt);
                   const orderTimeLabel = Number.isNaN(createdAt.getTime()) ? '-' : format(createdAt, 'HH:mm:ss');
 
@@ -480,16 +484,8 @@ const SessionSalesList = ({ sessionId }: { sessionId: string }) => {
                       </div>
 
                       <div className="mt-3 flex flex-wrap gap-2">
-                        <Badge variant={orderStatusBadge[order.status]}>
-                          {order.status}
-                        </Badge>
-                        {isEisPending && (
-                          <Badge variant="outline" className="border-amber-300 text-amber-700">
-                            Fiscal Pending
-                          </Badge>
-                        )}
+                        <Badge variant={displayStatusVariant}>{displayStatus}</Badge>
                       </div>
-
                       <div className="mt-3 space-y-2">
                         <MobileInfoRow
                           label="Buyer"
@@ -534,8 +530,15 @@ const SessionSalesList = ({ sessionId }: { sessionId: string }) => {
                     {orderedSessionSales.map((order) => {
                       const buyerDetails = resolveBuyerDetails(order);
                       const buyerName = buyerDetails.name || 'Walk-in';
-                      const eisStatus = resolveEisStatus(order);
-                      const isEisPending = eisStatus === 'PENDING' || (!eisStatus && Boolean((order as any)?._dirty));
+                      const eisDisplayStatus = resolveEisSaleStatusLabel(order, true);
+                      const displayStatus = eisDisplayStatus || order.status;
+                      const displayStatusVariant = eisDisplayStatus === 'Fiscal Failed'
+                        ? 'destructive'
+                        : eisDisplayStatus === 'EIS Pending'
+                          ? 'outline'
+                          : eisDisplayStatus === 'EIS Submitted'
+                            ? 'default'
+                            : orderStatusBadge[order.status];
 
                       return (
                         <TableRow
@@ -555,14 +558,7 @@ const SessionSalesList = ({ sessionId }: { sessionId: string }) => {
                           <TableCell className="text-sm">{order.paymentMethod}</TableCell>
                           <TableCell>
                             <div className="flex flex-col items-start gap-1">
-                              <Badge variant={orderStatusBadge[order.status]}>
-                                {order.status}
-                              </Badge>
-                              {isEisPending && (
-                                <Badge variant="outline" className="border-amber-300 text-amber-700">
-                                  Fiscal Pending
-                                </Badge>
-                              )}
+                              <Badge variant={displayStatusVariant}>{displayStatus}</Badge>
                             </div>
                           </TableCell>
                           <TableCell className="text-right text-sm">{formatCurrency(order.subtotal)}</TableCell>

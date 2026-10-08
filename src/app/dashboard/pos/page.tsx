@@ -35,8 +35,15 @@ import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/hooks/use-auth';
 import { getBackendConnectionIssue, useBackendReachability } from '@/hooks/use-backend-reachability';
 import { authFetch } from '@/lib/auth-fetch';
+import { isEisSaleNotCreated } from '@/lib/eis-submission';
 import { v4 as uuidv4 } from 'uuid';
-import { saveSaleToLocalStorage, addPendingSale, markSaleAsSynced, markSaleAsFailed } from '@/lib/services/sales-service';
+import {
+  saveSaleToLocalStorage,
+  addPendingSale,
+  markSaleAsSynced,
+  markSaleAsFailed,
+  removeRejectedSaleLocally,
+} from '@/lib/services/sales-service';
 import { syncInventoryFromBackend } from '@/lib/services/inventory-sync';
 import { isTauriApp } from '@/lib/tauri-init';
 import { logAuditAction } from '@/lib/audit';
@@ -453,6 +460,16 @@ const isRetryBlockedBackendOrderError = (statusCode: number, message: string): b
     'compliance policy',
     'cannot submit an empty pos order',
   ].some((needle) => normalized.includes(needle));
+};
+
+const isConfirmedMraRejection = (payload: any): boolean => {
+  const diagnostic = payload?.mra_submission ?? payload?.mraSubmission;
+  return (
+    String(payload?.reason || '').trim().toLowerCase() === 'eis_rejected' ||
+    String(payload?.eis_status ?? payload?.eisStatus ?? '').trim().toUpperCase() === 'REJECTED' ||
+    String(diagnostic?.state || '').trim().toLowerCase() === 'rejected' ||
+    String(diagnostic?.eis_status ?? diagnostic?.eisStatus ?? '').trim().toUpperCase() === 'REJECTED'
+  );
 };
 
 const isReceiptValidationUrl = (value: unknown): boolean => {
@@ -919,9 +936,13 @@ export default function PosPage() {
       const candidates = getBranchIdCandidates(activeBranchId);
       if (candidates.length === 0) return [];
       if (candidates.length === 1) {
-        return db.inventory.where({ branchId: candidates[0] }).toArray();
+        return db.inventory.where({ branchId: candidates[0] }).toArray().then((items) => (
+          items.filter((item) => item._operation !== 'delete')
+        ));
       }
-      return db.inventory.where('branchId').anyOf(candidates).toArray();
+      return db.inventory.where('branchId').anyOf(candidates).toArray().then((items) => (
+        items.filter((item) => item._operation !== 'delete')
+      ));
     },
     [activeBranchId]
   );
@@ -1503,8 +1524,8 @@ export default function PosPage() {
     }
 
     const defaultTaxRateAmount = defaultTaxRate ? defaultTaxRate.rate / 100 : 0;
-    let shouldUseMappings = eisEnabled;
-    let shouldEnforceTaxMapping = eisEnabled && blockSalesIfTaxMappingMissing === true;
+    let shouldUseMappings = eisEnabled || blockSalesIfTaxMappingMissing === true;
+    let shouldEnforceTaxMapping = shouldUseMappings;
     let mappingByItemId = new Map<string, any>();
 
     if (shouldUseMappings) {
@@ -1530,9 +1551,9 @@ export default function PosPage() {
         });
         mappingByItemId = buildMappingLookup(scopedMappings);
       } catch (mappingError) {
-        console.warn('[POS Page] Failed to load local MRA mappings, falling back to default tax:', mappingError);
-        shouldUseMappings = false;
-        shouldEnforceTaxMapping = false;
+        console.warn('[POS Page] Failed to load local MRA mappings; EIS sales will be blocked if mappings are unavailable:', mappingError);
+        shouldUseMappings = eisEnabled || blockSalesIfTaxMappingMissing === true;
+        shouldEnforceTaxMapping = shouldUseMappings;
         mappingByItemId = new Map<string, any>();
       }
     }
@@ -1646,6 +1667,11 @@ export default function PosPage() {
     let orderCogs = 0;
     let finalOrder: Order | null = null;
     let orderForBackend: any = null;
+    const localInventoryConsumption: Array<{
+      inventoryItemId: string;
+      quantity: number;
+      purchaseHistoryId?: string | number;
+    }> = [];
 
     try {
       await db.transaction('rw', db.inventory, db.orders, db.sessions, db.purchaseHistory, async () => {
@@ -1754,6 +1780,11 @@ export default function PosPage() {
                 _dirty: true,
                 _operation: 'update',
               });
+              localInventoryConsumption.push({
+                inventoryItemId: String(itemToDecrement.id),
+                quantity: decrementAmount,
+                purchaseHistoryId: batch.id,
+              });
 
               const netUnitCost = resolveNetUnitCostFromBatch(batch);
               orderCogs += decrementAmount * netUnitCost;
@@ -1775,6 +1806,10 @@ export default function PosPage() {
 
               if (fallbackInventoryDecrement > 0) {
                 orderCogs += fallbackInventoryDecrement * toNonNegativeNumber(inventoryItemToUpdate.cost, 0);
+                localInventoryConsumption.push({
+                  inventoryItemId: String(itemToDecrement.id),
+                  quantity: fallbackInventoryDecrement,
+                });
               }
             }
 
@@ -1851,6 +1886,9 @@ export default function PosPage() {
           tip: appliedTip,
           total,
           cogs: orderCogs,
+          localInventoryConsumption: localInventoryConsumption.length > 0
+            ? localInventoryConsumption
+            : undefined,
           eis_status: eisEnabled ? 'PENDING' : undefined,
           eisStatus: eisEnabled ? 'PENDING' : undefined,
           createdAt: new Date().toISOString(),
@@ -2012,6 +2050,27 @@ export default function PosPage() {
                 !['accepted', 'offline_queued'].includes(mraSubmissionState)
               );
 
+              const saleWasNotCreated = isEisSaleNotCreated({
+                ...normalizedResponse,
+                mraSubmission,
+                mra_submission: mraSubmission,
+              });
+
+              if (saleWasNotCreated) {
+                const rejectionMessage = mraSubmissionMessage || 'MRA rejected the fiscal sale.';
+                await removeRejectedSaleLocally(finalOrderId, rejectionMessage);
+                toast({
+                  variant: 'destructive',
+                  title: isConfirmedMraRejection({
+                    ...normalizedResponse,
+                    mraSubmission,
+                    mra_submission: mraSubmission,
+                  }) ? 'Sale Rejected by MRA' : 'Sale Not Completed',
+                  description: rejectionMessage,
+                });
+                return null;
+              }
+
               const fiscalUpdate: Record<string, any> = {
                 _dirty: false,
                 _operation: undefined,
@@ -2117,6 +2176,17 @@ export default function PosPage() {
                 'Sale could not be completed. Please try again.'
               );
               const userMessage = cleanUserFacingOrderError(errorMessage);
+              if (eisEnabled && isEisSaleNotCreated(errorData)) {
+                await removeRejectedSaleLocally(finalOrderId, userMessage);
+                toast({
+                  variant: 'destructive',
+                  title: isConfirmedMraRejection(errorData)
+                    ? 'Sale Rejected by MRA'
+                    : 'Sale Not Completed',
+                  description: userMessage,
+                });
+                return null;
+              }
               const retryBlocked = isRetryBlockedBackendOrderError(response.status, errorMessage);
               console.warn('[Order] Backend rejected order:', response.status, errorData);
               markSaleAsFailed(finalOrderId, userMessage, { retryBlocked });
@@ -2146,17 +2216,20 @@ export default function PosPage() {
           const fiscalizedOrder = await submitOrderToBackend();
           if (fiscalizedOrder) {
             finalOrder = fiscalizedOrder;
-          } else if (finalOrderId) {
-            const latestOrder = await db.orders.get(finalOrderId);
-            if (latestOrder) {
-              finalOrder = latestOrder as Order;
-            }
+          } else {
+            // Do not let the provisional local order fall through to the
+            // success toast/modal when fiscal submission failed or was rejected.
+            finalOrder = null;
           }
         } else {
           void submitOrderToBackend();
         }
       } else {
         console.warn('[Order] Cannot sync - finalOrder or orderForBackend is null', { finalOrder, orderForBackend });
+      }
+
+      if (eisEnabled && !finalOrder) {
+        return null;
       }
 
       // 7. Mark take orders as completed

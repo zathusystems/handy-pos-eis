@@ -84,7 +84,7 @@ export function TauriReadySignal() {
       try {
         const { emit } = await import('@tauri-apps/api/event');
         await emit('frontend-ready', { timestamp: Date.now() });
-        console.log('[Tauri Splash] Emitted frontend-ready');
+
       } catch (error) {
         console.warn('[Tauri Splash] Failed to emit frontend-ready:', error);
       }

@@ -196,6 +196,77 @@ fn clear_session_snapshot(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn save_receipt_pdf(
+    app: tauri::AppHandle,
+    filename: String,
+    content: Vec<u8>,
+) -> Result<String, String> {
+    if content.is_empty() {
+        return Err("Receipt PDF is empty.".to_string());
+    }
+
+    let sanitized_filename = filename
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+
+    let mut final_filename = if sanitized_filename.trim().is_empty() {
+        "thermal-receipt.pdf".to_string()
+    } else {
+        sanitized_filename
+    };
+    if !final_filename.to_ascii_lowercase().ends_with(".pdf") {
+        final_filename.push_str(".pdf");
+    }
+
+    let mut target_directories: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(dir) = app.path().download_dir() {
+        target_directories.push(dir);
+    }
+    if let Ok(dir) = app.path().document_dir() {
+        target_directories.push(dir);
+    }
+    if let Ok(dir) = app.path().data_dir() {
+        target_directories.push(dir);
+    }
+    if let Ok(dir) = app.path().cache_dir() {
+        target_directories.push(dir);
+    }
+
+    let mut last_error: Option<String> = None;
+    for directory in target_directories {
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            last_error = Some(format!(
+                "Could not create directory {}: {}",
+                directory.display(),
+                error
+            ));
+            continue;
+        }
+
+        let output_path = directory.join(&final_filename);
+        match std::fs::write(&output_path, &content) {
+            Ok(_) => return Ok(output_path.display().to_string()),
+            Err(error) => {
+                last_error = Some(format!(
+                    "Failed writing {}: {}",
+                    output_path.display(),
+                    error
+                ));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "No writable directory available for receipt PDF export.".to_string()))
+}
+
+#[tauri::command]
 fn save_inventory_template_csv(
     app: tauri::AppHandle,
     filename: String,
@@ -319,6 +390,7 @@ pub fn run() {
         clear_session_snapshot,
         get_device_identity,
         get_device_mac_address,
+        save_receipt_pdf,
         save_inventory_template_csv,
     ]);
 

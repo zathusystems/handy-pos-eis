@@ -159,6 +159,10 @@ export async function deleteProduct(
       ...existingProduct,
       _dirty: true,
       _operation: 'delete' as const,
+      syncRetryBlocked: false,
+      syncStatus: 'pending',
+      syncError: undefined,
+      syncFailedAt: undefined,
       _deletedAt: new Date().toISOString()
     };
 
@@ -180,9 +184,12 @@ export async function deleteProduct(
     // 4. Trigger sync if online
     if (typeof window !== 'undefined' && navigator.onLine) {
       console.log('[Product Service] Triggering sync after product deletion');
-      syncService.performFullSync(branchId).catch(err => 
-        console.error('[Product Service] Sync failed:', err)
-      );
+      try {
+        await syncService.performFullSync(branchId);
+        console.log('[Product Service] Backend deletion sync completed:', productId);
+      } catch (err) {
+        console.error('[Product Service] Sync failed:', err);
+      }
     } else {
       console.log('[Product Service] Offline - product deletion queued for sync when online');
     }

@@ -14,6 +14,7 @@ import {
 import { useLiveQuery } from 'dexie-react-hooks';
 
 import { db, type Order } from '@/lib/db';
+import { resolveEisSaleStatusLabel } from '@/lib/eis-submission';
 import { authFetch } from '@/lib/auth-fetch';
 import { ensureTauriDeviceIdentity, getDeviceSerial } from '@/lib/device-identity';
 import { useCurrency } from '@/hooks/use-currency';
@@ -266,6 +267,10 @@ const resolveFiscalInvoiceNumber = (order: Order | null | undefined): string => 
 
 const resolveEisStatus = (order: Order | null | undefined): Order['eis_status'] | 'MISSING' => {
   const source = order as any;
+  const displayStatus = resolveEisSaleStatusLabel(order, true);
+  if (displayStatus === 'Fiscal Failed') return 'REJECTED';
+  if (displayStatus === 'EIS Submitted') return 'SUBMITTED';
+  if (displayStatus === 'EIS Pending') return 'PENDING';
   const raw = toTrimmedString(source?.eisStatus ?? source?.eis_status).toUpperCase();
   if (raw === 'PENDING' || raw === 'SUBMITTED' || raw === 'ACCEPTED' || raw === 'REJECTED') {
     return raw as Order['eis_status'];
@@ -1106,6 +1111,14 @@ export default function EisSalesAuditPage() {
                 ) : (
                   paginatedItems.map((order) => {
                     const status = resolveEisStatus(order);
+                    const displayStatus = resolveEisSaleStatusLabel(order, true) || status;
+                    const displayStatusVariant = displayStatus === 'Fiscal Failed'
+                      ? 'destructive'
+                      : displayStatus === 'EIS Pending'
+                        ? 'secondary'
+                        : displayStatus === 'EIS Submitted'
+                          ? 'default'
+                          : getStatusBadgeVariant(status);
                     const fiscalInvoice = resolveFiscalInvoiceNumber(order);
                     const createdAt = getOrderCreatedDate(order);
                     const qrUrl = toTrimmedString((order as any).qrCodePayload ?? (order as any).qr_code_payload);
@@ -1120,9 +1133,9 @@ export default function EisSalesAuditPage() {
                         <TableCell className="whitespace-nowrap">{formatDateTime(createdAt)}</TableCell>
                         <TableCell className="max-w-[180px] truncate">{resolveBuyerText(order) || 'Walk-in'}</TableCell>
                         <TableCell>
-                          <Badge variant={getStatusBadgeVariant(status)} className="gap-1">
-                            {status === 'REJECTED' ? <X className="h-3 w-3" /> : status === 'ACCEPTED' || status === 'SUBMITTED' ? <Check className="h-3 w-3" /> : null}
-                            {status}
+                          <Badge variant={displayStatusVariant} className="gap-1">
+                            {displayStatus === 'Fiscal Failed' ? <X className="h-3 w-3" /> : displayStatus === 'EIS Submitted' ? <Check className="h-3 w-3" /> : null}
+                            {displayStatus}
                           </Badge>
                         </TableCell>
                         <TableCell className="text-right">{formatCurrency(toFiniteNumber((order as any).vatAmount ?? (order as any).vat_amount ?? (order as any).tax))}</TableCell>

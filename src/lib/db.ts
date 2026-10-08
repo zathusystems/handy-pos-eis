@@ -243,6 +243,12 @@ export interface OrderItem {
     vatCategory?: string; // Alias for vat_category (camelCase)
 }
 
+export interface LocalInventoryConsumption {
+    inventoryItemId: string;
+    quantity: number;
+    purchaseHistoryId?: string | number;
+}
+
 export interface Order {
     id: string;
     orderNumber: number;
@@ -251,6 +257,8 @@ export interface Order {
     pumpName?: string; // Fuel pump used for this order (optional)
     orderType?: 'sale' | 'return' | 'adjustment'; // Type of order
     items: OrderItem[];
+    // Local-only FIFO details used to restore provisional stock when EIS rejects a sale.
+    localInventoryConsumption?: LocalInventoryConsumption[];
     status: 'New' | 'Preparing' | 'Ready' | 'Completed' | 'Voided' | 'Cancelled' | 'Refunded' | 'Partially Refunded';
     subtotal: number;
     discountAmount?: number;
@@ -314,6 +322,10 @@ export interface Order {
     eisUuid?: string; // Alias for eis_uuid (camelCase)
     eis_status?: 'PENDING' | 'SUBMITTED' | 'ACCEPTED' | 'REJECTED'; // MRA submission status
     eisStatus?: 'PENDING' | 'SUBMITTED' | 'ACCEPTED' | 'REJECTED'; // Alias for eis_status (camelCase)
+    eis_sync_state?: string;
+    eisSyncState?: string;
+    mra_submission?: Record<string, any>;
+    mraSubmission?: Record<string, any>;
     eis_submitted_at?: string; // ISO string - when submitted to MRA
     eisSubmittedAt?: string; // Alias for eis_submitted_at (camelCase)
     qr_code_payload?: string; // QR code payload from MRA

@@ -61,7 +61,10 @@ import {
   normalizeDeviceMacAddress,
 } from '@/lib/device-identity';
 import { downloadBlobFile, downloadTextFile } from '@/lib/file-download';
-import { syncInventoryFromBackend } from '@/lib/services/inventory-sync';
+import {
+  formatMraProductSyncDiagnostics,
+  syncInventoryFromBackend,
+} from '@/lib/services/inventory-sync';
 
 // Schemas
 const eisSetupSchema = z.object({
@@ -972,12 +975,16 @@ const normalizeMacAddress = (value?: string | null): string => {
 
 export default function EISSettingsPage() {
   const ACTIVE_BRANCH_STORAGE_KEY = 'handypos-active-branch';
-  const { business } = useAuth();
+  const { business, loading: isAuthLoading } = useAuth();
   const searchParams = useSearchParams();
   const activationRequired = searchParams.get('activationRequired') === '1';
   const requestedBranchId = searchParams.get('branch') || '';
   const [branches, setBranches] = useState<Branch[]>([]);
   const [terminal, setTerminal] = useState<Terminal | null>(null);
+  const [isLoadingEisSettings, setIsLoadingEisSettings] = useState(true);
+  const [isLoadingBranches, setIsLoadingBranches] = useState(true);
+  const [isTerminalDataReady, setIsTerminalDataReady] = useState(false);
+  const [isInitialConfigurationReady, setIsInitialConfigurationReady] = useState(false);
   const [isActivatingTerminal, setIsActivatingTerminal] = useState(false);
   const [isLoadingTerminal, setIsLoadingTerminal] = useState(false);
   const [isRefreshingTerminalStatus, setIsRefreshingTerminalStatus] = useState(false);
@@ -1017,6 +1024,9 @@ export default function EISSettingsPage() {
   const [isLoadingConfigurationStatus, setIsLoadingConfigurationStatus] = useState(false);
   const [showTacPassword, setShowTacPassword] = useState(false);
   const [deviceIdentityRefreshKey, setDeviceIdentityRefreshKey] = useState(0);
+  const terminalLoadRequestRef = useRef(0);
+  const configurationContextKeyRef = useRef('');
+  const configurationLoadRequestRef = useRef(0);
   const initialStockImportFileRef = useRef<HTMLInputElement | null>(null);
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
     setup: true,
@@ -1122,7 +1132,8 @@ export default function EISSettingsPage() {
     currentDeviceSerial &&
     terminal.device_serial.toLowerCase() !== currentDeviceSerial.toLowerCase()
   );
-  const terminalIsActive = terminal?.status === 'active' && !terminalDeviceMismatch;
+  const terminalHasBeenActivated = terminal?.status === 'active';
+  const terminalIsActive = terminalHasBeenActivated && !terminalDeviceMismatch;
   const terminalIsBlocked = terminal?.status === 'suspended' || terminal?.blocking_status?.is_blocked === true;
   const terminalHasToken = Boolean(terminal?.has_mra_token || terminal?.token_expires_at);
   const showActivationForm = !terminal || terminal.status !== 'active' || terminalDeviceMismatch;
@@ -1195,8 +1206,16 @@ export default function EISSettingsPage() {
   }, [business?.id]);
 
   const loadTerminalForBranch = useCallback(async (branchId: string) => {
+    const requestId = ++terminalLoadRequestRef.current;
+    const isCurrentRequest = () => terminalLoadRequestRef.current === requestId;
+    setIsTerminalDataReady(false);
+
     if (!business?.id || !branchId) {
-      setTerminal(null);
+      if (isCurrentRequest()) {
+        setTerminal(null);
+        setIsLoadingTerminal(false);
+        setIsTerminalDataReady(true);
+      }
       return;
     }
 
@@ -1216,12 +1235,15 @@ export default function EISSettingsPage() {
         null
       );
 
+      if (!isCurrentRequest()) return;
+
       if (selected) {
         let mapped = mapTerminalFromApi(selected);
         setTerminal(mapped);
         persistTerminalCache(branchId, mapped);
         try {
           const statusResponse = await authFetch.fetch<any>(`/mra-eis/terminals/${mapped.id}/status/?ping=true`);
+          if (!isCurrentRequest()) return;
           mapped = mapTerminalFromApi(statusResponse, mapped);
           setTerminal(mapped);
           persistTerminalCache(branchId, mapped);
@@ -1229,10 +1251,12 @@ export default function EISSettingsPage() {
           console.warn('[EIS Settings] Failed to refresh terminal ping status:', statusError);
         }
       } else {
+        if (!isCurrentRequest()) return;
         setTerminal(null);
         persistTerminalCache(branchId, null);
       }
     } catch (error) {
+      if (!isCurrentRequest()) return;
       console.error('Error loading terminal from backend:', error);
       const cacheKey = getTerminalStorageKey(String(business.id), String(branchId));
       const cachedTerminal = localStorage.getItem(cacheKey);
@@ -1246,7 +1270,10 @@ export default function EISSettingsPage() {
         setTerminal(null);
       }
     } finally {
-      setIsLoadingTerminal(false);
+      if (isCurrentRequest()) {
+        setIsLoadingTerminal(false);
+        setIsTerminalDataReady(true);
+      }
     }
   }, [business?.id, persistTerminalCache]);
 
@@ -1305,10 +1332,19 @@ export default function EISSettingsPage() {
 
   // Load business settings
   useEffect(() => {
-    if (business?.id) {
-      const loadSettings = async () => {
-        try {
-          const backendBusiness = await authFetch.fetch<any>(`/business/businesses/${business.id}/`);
+    let cancelled = false;
+
+    if (!business?.id) {
+      setIsLoadingEisSettings(isAuthLoading);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setIsLoadingEisSettings(true);
+    const loadSettings = async () => {
+      try {
+        const backendBusiness = await authFetch.fetch<any>(`/business/businesses/${business.id}/`);
           
           if (backendBusiness) {
             const rawEnableEis =
@@ -1337,29 +1373,44 @@ export default function EISSettingsPage() {
               blockSalesIfTaxMappingMissing: blockTaxMappingValue,
             });
           }
-        } catch (error) {
-          console.error('Error loading EIS settings:', error);
-          if (activationRequired) {
-            eisForm.setValue('enableEis', true, { shouldValidate: true });
-          }
+      } catch (error) {
+        console.error('Error loading EIS settings:', error);
+        if (activationRequired) {
+          eisForm.setValue('enableEis', true, { shouldValidate: true });
         }
-      };
-      loadSettings();
-    }
-  }, [activationRequired, business?.id, eisForm]);
+      } finally {
+        if (!cancelled) setIsLoadingEisSettings(false);
+      }
+    };
+
+    void loadSettings();
+    return () => {
+      cancelled = true;
+    };
+  }, [activationRequired, business?.id, eisForm, isAuthLoading]);
 
   // Load branches
   useEffect(() => {
-    if (business?.id) {
-      const loadBranches = async () => {
-        try {
-          const response = await authFetch.fetch<any>(`/business/businesses/${business.id}/`);
+    let cancelled = false;
+
+    if (!business?.id) {
+      setIsLoadingBranches(isAuthLoading);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setIsLoadingBranches(true);
+    const loadBranches = async () => {
+      try {
+        const response = await authFetch.fetch<any>(`/business/businesses/${business.id}/`);
           if (response?.branches && Array.isArray(response.branches)) {
             const mappedBranches: Branch[] = response.branches.map((branch: any) => ({
               id: String(branch.id),
               name: branch.name || 'Branch',
               address: branch.address || '',
             }));
+            if (cancelled) return;
             setBranches(mappedBranches);
 
             const currentBranch = terminalForm.getValues('activeBranch');
@@ -1379,17 +1430,23 @@ export default function EISSettingsPage() {
             if (nextBranch) {
               terminalForm.setValue('activeBranch', nextBranch, { shouldValidate: true });
             }
-          } else {
-            setBranches([]);
-            terminalForm.setValue('activeBranch', '');
-          }
-        } catch (error) {
-          console.error('Error loading branches:', error);
+        } else {
+          if (cancelled) return;
+          setBranches([]);
+          terminalForm.setValue('activeBranch', '');
         }
-      };
-      loadBranches();
-    }
-  }, [business?.id, requestedBranchId, terminalForm, ACTIVE_BRANCH_STORAGE_KEY]);
+      } catch (error) {
+        console.error('Error loading branches:', error);
+      } finally {
+        if (!cancelled) setIsLoadingBranches(false);
+      }
+    };
+
+    void loadBranches();
+    return () => {
+      cancelled = true;
+    };
+  }, [business?.id, requestedBranchId, terminalForm, ACTIVE_BRANCH_STORAGE_KEY, isAuthLoading]);
 
   useEffect(() => {
     if (!business?.id || !activeBranchId) {
@@ -1402,13 +1459,78 @@ export default function EISSettingsPage() {
   }, [business?.id, activeBranchId, loadTerminalForBranch, ACTIVE_BRANCH_STORAGE_KEY]);
 
   useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const resetBranchScopedState = () => {
+      setTerminal(null);
+      setIsTerminalDataReady(false);
+      setLastSubmitReconciliation(null);
+      setConfigurationStatus(createDefaultConfigurationStatus());
+      setIsInitialConfigurationReady(false);
+      configurationContextKeyRef.current = '';
+      setSyncedConfigurations([]);
+      setInitialStockSubmissionPreview(null);
+      setIsInitialStockPreviewOpen(false);
+      setIsActivationModalOpen(false);
+      setMraHsCodes([]);
+      setMraUnitsOfMeasure([]);
+    };
+
+    const applyBranchChange = (rawBranchId?: unknown) => {
+      const nextBranchId = String(
+        rawBranchId ?? localStorage.getItem(ACTIVE_BRANCH_STORAGE_KEY) ?? ''
+      ).trim();
+      if (!nextBranchId || nextBranchId === terminalForm.getValues('activeBranch')) {
+        return;
+      }
+
+      resetBranchScopedState();
+      terminalForm.setValue('activeBranch', nextBranchId, { shouldValidate: true });
+    };
+
+    const handleBranchChanged = (event: Event) => {
+      applyBranchChange((event as CustomEvent).detail?.branchId);
+    };
+
+    const handleStorageChanged = (event: StorageEvent) => {
+      if (event.key === ACTIVE_BRANCH_STORAGE_KEY) {
+        applyBranchChange(event.newValue);
+      }
+    };
+
+    window.addEventListener('branchChanged', handleBranchChanged);
+    window.addEventListener('handypos-active-branch-changed', handleBranchChanged);
+    window.addEventListener('storage', handleStorageChanged);
+
+    return () => {
+      window.removeEventListener('branchChanged', handleBranchChanged);
+      window.removeEventListener('handypos-active-branch-changed', handleBranchChanged);
+      window.removeEventListener('storage', handleStorageChanged);
+    };
+  }, [ACTIVE_BRANCH_STORAGE_KEY, terminalForm]);
+  useEffect(() => {
+    const configurationContextKey = `${business?.id || ''}:${activeBranchId || ''}:${activationUiEnabled ? 'enabled' : 'disabled'}`;
+
     if (!business?.id || !activationUiEnabled) {
       setConfigurationStatus(createDefaultConfigurationStatus());
       setSyncedConfigurations([]);
+      setIsInitialConfigurationReady(true);
+      configurationContextKeyRef.current = configurationContextKey;
       return;
     }
-    loadConfigurationStatus();
-  }, [activationUiEnabled, business?.id, terminal?.id, terminal?.status, loadConfigurationStatus]);
+
+    const requestId = ++configurationLoadRequestRef.current;
+    const shouldGatePage = configurationContextKeyRef.current !== configurationContextKey;
+    if (shouldGatePage) setIsInitialConfigurationReady(false);
+
+    void loadConfigurationStatus().finally(() => {
+      if (configurationLoadRequestRef.current !== requestId) return;
+      if (shouldGatePage) {
+        configurationContextKeyRef.current = configurationContextKey;
+        setIsInitialConfigurationReady(true);
+      }
+    });
+  }, [activationUiEnabled, activeBranchId, business?.id, terminal?.id, terminal?.status, loadConfigurationStatus]);
 
   const onEISSetupSubmit = async (data: EISSetupFormValues) => {
     if (!business?.id) {
@@ -1444,7 +1566,7 @@ export default function EISSettingsPage() {
         block_sales_if_tax_mapping_missing: data.blockSalesIfTaxMappingMissing,
       };
 
-      console.log('[EIS Settings] Sending payload:', backendPayload);
+
 
       const response = await authFetch.fetch(`/business/businesses/${business.id}/`, {
         method: 'PUT',
@@ -1452,7 +1574,7 @@ export default function EISSettingsPage() {
       });
 
       if (response) {
-        console.log('[EIS Settings] Response:', response);
+
         persistBusinessSettingsCache({
           enableEis: data.enableEis,
           eisEnvironment: data.eisEnvironment,
@@ -2098,12 +2220,32 @@ export default function EISSettingsPage() {
           body: JSON.stringify({ refreshFromMra: true }),
         }
       );
-      const syncResult = await syncInventoryFromBackend(activeBranchId);
+      const syncResult = await syncInventoryFromBackend(activeBranchId, {
+        authoritativeMraStock: true,
+        mraMappings: Array.isArray(response?.mra_mappings)
+          ? response.mra_mappings
+          : undefined,
+      });
 
       toast({
         title: 'MRA products synced',
         description: `${response?.created ?? 0} created, ${response?.updated ?? 0} updated.`,
       });
+      const syncDiagnostics = formatMraProductSyncDiagnostics({
+        skippedProducts: response?.skipped_invalid_products ?? response?.skippedInvalidProducts,
+        taxpayerIncompatible: response?.taxpayer_incompatible ?? response?.taxpayerIncompatible,
+        notImportedCount: Math.max(
+          0,
+          Number(response?.product_count ?? 0) - Number(response?.imported_product_count ?? 0)
+        ),
+      });
+      if (syncDiagnostics) {
+        toast({
+          variant: 'destructive',
+          title: 'Some EIS products need attention',
+          description: syncDiagnostics,
+        });
+      }
     } catch (error: any) {
       console.error('Pull approved MRA products error:', error);
       toast({
@@ -2412,6 +2554,28 @@ export default function EISSettingsPage() {
   };
 
   const initialStockPreviewRows = initialStockSubmissionPreview?.products.slice(0, 50) || [];
+
+  const isPageLoading =
+    isAuthLoading ||
+    isLoadingEisSettings ||
+    isLoadingBranches ||
+    (activationUiEnabled && branches.length > 0 && (
+      !activeBranchId ||
+      !isTerminalDataReady ||
+      isLoadingTerminal ||
+      !isInitialConfigurationReady
+    ));
+
+  if (isPageLoading) {
+    return (
+      <div className="flex min-h-[360px] items-center justify-center">
+        <div className="flex items-center gap-3 text-sm text-muted-foreground">
+          <Loader2 className="h-5 w-5 animate-spin" />
+          Loading EIS settings...
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -2824,7 +2988,11 @@ export default function EISSettingsPage() {
                           <FormItem>
                             <FormLabel className="text-sm">TIN (Taxpayer ID)</FormLabel>
                             <FormControl>
-                              <Input placeholder="e.g., 123456789" {...field} />
+                              <Input
+                                placeholder="e.g., 123456789"
+                                disabled={terminalHasBeenActivated}
+                                {...field}
+                              />
                             </FormControl>
                             <FormMessage />
                           </FormItem>
@@ -2836,7 +3004,11 @@ export default function EISSettingsPage() {
                         render={({ field }) => (
                           <FormItem>
                             <FormLabel className="text-sm">Environment</FormLabel>
-                            <Select value={field.value} onValueChange={field.onChange}>
+                            <Select
+                              value={field.value}
+                              onValueChange={field.onChange}
+                              disabled={terminalHasBeenActivated}
+                            >
                               <FormControl>
                                 <SelectTrigger className="text-sm">
                                   <SelectValue />

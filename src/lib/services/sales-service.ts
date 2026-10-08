@@ -4,6 +4,7 @@ import { db, type Order } from '@/lib/db';
 
 const SALES_STORAGE_KEY = 'handypos-sales';
 const PENDING_SALES_KEY = 'handypos-pending-sales';
+const LAST_REJECTED_SALE_KEY = 'handypos-last-rejected-sale';
 
 export interface SaleRecord extends Order {
   syncedAt?: string;
@@ -74,6 +75,167 @@ export function addPendingSale(order: Order): void {
     console.log('[Sales Service] Added pending sale:', order.id);
   } catch (error) {
     console.error('[Sales Service] Failed to add pending sale:', error);
+  }
+}
+
+/**
+ * Remove a provisional sale after a confirmed EIS rejection.
+ *
+ * Network failures remain pending for retry. This path is only for a sale
+ * that MRA explicitly rejected, so its local order, stock movement, session
+ * totals, audit row, and localStorage records must all disappear together.
+ */
+export async function removeRejectedSaleLocally(
+  orderId: string,
+  reason = 'MRA rejected the fiscal sale.'
+): Promise<void> {
+  try {
+    const existingOrder = await db.orders.get(orderId);
+    if (existingOrder) {
+      await db.transaction(
+        'rw',
+        db.inventory,
+        db.orders,
+        db.sessions,
+        db.purchaseHistory,
+        async () => {
+          const order = await db.orders.get(orderId);
+          if (!order) return;
+
+          const recordedConsumption = Array.isArray(order.localInventoryConsumption)
+            ? order.localInventoryConsumption
+            : [];
+          const consumption: NonNullable<Order['localInventoryConsumption']> = recordedConsumption.length > 0
+            ? recordedConsumption
+            : (order.items || [])
+                .map((item) => ({
+                  inventoryItemId: String(item.inventoryItemId || item.inventory_item_id || ''),
+                  quantity: Number(item.quantity || 0),
+                }))
+                .filter((item) => item.inventoryItemId && Number.isFinite(item.quantity) && item.quantity > 0);
+
+          for (const entry of consumption) {
+            const quantity = Number(entry.quantity || 0);
+            if (!Number.isFinite(quantity) || quantity <= 0) continue;
+
+            if (entry.purchaseHistoryId !== undefined && entry.purchaseHistoryId !== null) {
+              const batch = await db.purchaseHistory.get(entry.purchaseHistoryId as any);
+              if (batch) {
+                await db.purchaseHistory.update(batch.id!, {
+                  quantityRemaining: Number(batch.quantityRemaining || 0) + quantity,
+                  _dirty: false,
+                  _operation: undefined,
+                });
+              }
+            }
+
+            const inventoryItem = await db.inventory.get(String(entry.inventoryItemId));
+            if (inventoryItem) {
+              const stockUnits = Number(inventoryItem.stockUnits || 0) + quantity;
+              const reorderLevel = Number(inventoryItem.reorderLevel || 0);
+              await db.inventory.update(inventoryItem.id, {
+                stockUnits,
+                status: stockUnits <= 0
+                  ? 'Out of Stock'
+                  : stockUnits <= reorderLevel
+                    ? 'Low Stock'
+                    : 'In Stock',
+                _dirty: false,
+                _operation: undefined,
+              });
+            }
+          }
+
+          if (order.sessionId) {
+            const session = await db.sessions.get(order.sessionId);
+            if (session) {
+              const sessionUpdate: Record<string, any> = {
+                totalSales: Math.max(0, Number(session.totalSales || 0) - Number(order.subtotal || 0)),
+                _dirty: true,
+                _operation: 'update',
+              };
+              const saleAmount = Number(order.total || 0);
+              const paymentFields: Record<string, string> = {
+                Cash: 'totalCashSales',
+                Card: 'totalCardSales',
+                'Mobile Money': 'totalMobileMoneySales',
+                'On Account': 'totalOnAccountSales',
+                Other: 'totalOtherSales',
+              };
+              const paymentField = paymentFields[order.paymentMethod];
+              if (paymentField) {
+                sessionUpdate[paymentField] = Math.max(
+                  0,
+                  Number((session as any)[paymentField] || 0) - saleAmount
+                );
+              }
+              if (order.paymentMethod === 'Cash') {
+                sessionUpdate.expectedCash = Math.max(
+                  0,
+                  Number(session.expectedCash || 0) - saleAmount
+                );
+              }
+              await db.sessions.update(session.id, sessionUpdate);
+            }
+          }
+
+          await db.orders.delete(orderId);
+        }
+      );
+      await db.auditLog.where('entityId').equals(orderId).delete();
+    }
+
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem(
+          LAST_REJECTED_SALE_KEY,
+          JSON.stringify({
+            orderId,
+            reason,
+            recordedAt: new Date().toISOString(),
+          })
+        );
+      } catch (storageError) {
+        console.warn('[Sales Service] Failed to retain EIS rejection reason:', storageError);
+      }
+    }
+
+    removeSaleFromLocalStorage(orderId);
+    console.info('[Sales Service] Removed EIS-rejected provisional sale:', orderId, reason);
+  } catch (error) {
+    console.error('[Sales Service] Failed to remove EIS-rejected sale:', orderId, error);
+    throw error;
+  }
+}
+
+/** Read the most recent rejection reason for a sale removed after an explicit MRA rejection. */
+export function getLastRejectedSaleReason(orderId: string): string {
+  try {
+    if (typeof window === 'undefined') return '';
+
+    const raw = localStorage.getItem(LAST_REJECTED_SALE_KEY);
+    if (!raw) return '';
+
+    const record = JSON.parse(raw) as { orderId?: string; reason?: string };
+    return record.orderId === orderId ? String(record.reason || '').trim() : '';
+  } catch (error) {
+    console.warn('[Sales Service] Failed to read EIS rejection reason:', error);
+    return '';
+  }
+}
+
+/** Remove a sale from both localStorage history and the retry queue. */
+export function removeSaleFromLocalStorage(orderId: string): void {
+  try {
+    if (typeof window === 'undefined') return;
+
+    const sales = getSalesFromLocalStorage().filter((sale) => sale.id !== orderId);
+    localStorage.setItem(SALES_STORAGE_KEY, JSON.stringify(sales));
+
+    const pending = getPendingSales().filter((sale) => sale.id !== orderId);
+    localStorage.setItem(PENDING_SALES_KEY, JSON.stringify(pending));
+  } catch (error) {
+    console.error('[Sales Service] Failed to remove sale from localStorage:', error);
   }
 }
 

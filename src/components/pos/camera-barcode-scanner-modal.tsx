@@ -313,7 +313,7 @@ export function CameraBarcodeScannerModal({
           await handleBarcode(detectedValue);
         }
       } catch (error) {
-        console.debug('[Camera Scanner] Frame decode failed:', error);
+
       } finally {
         scanLockRef.current = false;
       }

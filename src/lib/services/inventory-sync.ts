@@ -121,6 +121,64 @@ export function getMraProductSyncError(error: unknown): string {
   return message;
 }
 
+export type MraProductSyncDiagnostics = {
+  skippedProducts?: Array<{
+    mra_product_code?: string;
+    name?: string;
+    fields?: string[];
+  }>;
+  taxpayerIncompatible?: Array<{
+    mra_product_code?: string;
+    name?: string;
+    error?: string;
+  }>;
+  notImportedCount?: number;
+};
+
+export function formatMraProductSyncDiagnostics(
+  result: MraProductSyncDiagnostics
+): string {
+  const skippedProducts = Array.isArray(result.skippedProducts) ? result.skippedProducts : [];
+  const taxpayerIncompatible = Array.isArray(result.taxpayerIncompatible)
+    ? result.taxpayerIncompatible
+    : [];
+  const notImportedCount = Number(result.notImportedCount || 0);
+  const details = skippedProducts
+    .slice(0, 3)
+    .map((product) => {
+      const label = String(product.name || product.mra_product_code || 'Unnamed product').trim();
+      const fields = Array.isArray(product.fields) && product.fields.length > 0
+        ? ` (${product.fields.join(', ')})`
+        : '';
+      return `${label}${fields}`;
+    });
+
+  const messages: string[] = [];
+  if (details.length > 0) {
+    messages.push(`Skipped: ${details.join('; ')}${skippedProducts.length > 3 ? '; ...' : '.'}`);
+  }
+  if (notImportedCount > skippedProducts.length) {
+    const remaining = notImportedCount - skippedProducts.length;
+    messages.push(
+      `${remaining} approved product${remaining === 1 ? '' : 's'} was not imported for this branch.`
+    );
+  }
+  if (taxpayerIncompatible.length > 0) {
+    const incompatibleDetails = taxpayerIncompatible
+      .slice(0, 2)
+      .map((product) => {
+        const label = String(product.name || product.mra_product_code || 'Unnamed product').trim();
+        const reason = String(product.error || '').trim();
+        return reason ? `${label}: ${reason}` : label;
+      });
+    messages.push(
+      `${taxpayerIncompatible.length} product${taxpayerIncompatible.length === 1 ? '' : 's'} need local tax setup review${incompatibleDetails.length > 0 ? ` (${incompatibleDetails.join('; ')})` : ''}.`
+    );
+  }
+
+  return messages.join(' ');
+}
+
 /**
  * Convert snake_case to camelCase
  */
@@ -311,25 +369,54 @@ function normalizeInventoryProduct(
  * Fetch products from backend and merge with local inventory
  * Also fetches and syncs MRA mappings
  */
-export async function syncInventoryFromBackend(branchId: string): Promise<{
+export async function syncInventoryFromBackend(
+  branchId: string,
+  options: {
+    authoritativeMraStock?: boolean;
+    mraMappings?: any[];
+  } = {}
+): Promise<{
   synced: number;
   updated: number;
   created: number;
   mraMappingsSynced?: number;
   stockReconciliationWarnings?: StockReconciliationWarning[];
+  skippedProducts?: Array<{
+    mra_product_code?: string;
+    name?: string;
+    fields?: string[];
+  }>;
+  taxpayerIncompatible?: Array<{
+    mra_product_code?: string;
+    name?: string;
+    error?: string;
+  }>;
+  notImportedCount?: number;
   error?: string;
 }> {
   try {
+    const authoritativeMraStock = options.authoritativeMraStock === true;
 
     const backendBranchId = toBackendBranchId(branchId);
 
     console.log('[InventorySync] Starting sync for branch:', branchId, 'backend ID:', backendBranchId);
 
-    // Fetch products from backend
+    // Start both downloads together. An explicit EIS pull already returns the
+    // fresh mappings, so callers can avoid requesting them again.
+    const mraMappingsPromise: Promise<any[]> = Array.isArray(options.mraMappings)
+      ? Promise.resolve(options.mraMappings)
+      : fetchPaginatedResults<any>(
+          `/inventory/mra-mappings/?branch_id=${backendBranchId}`,
+          'inventory MRA mappings'
+        ).catch((error) => {
+          console.error('[InventorySync] Failed to fetch MRA mappings:', error);
+          return [];
+        });
     const products = await fetchPaginatedResults<any>(
       `/inventory/products/?branch_id=${backendBranchId}`,
       'inventory products'
     );
+    const mraMappings = await mraMappingsPromise;
 
     let created = 0;
     let updated = 0;
@@ -343,13 +430,46 @@ export async function syncInventoryFromBackend(branchId: string): Promise<{
       }
 
       const localProduct = await db.inventory.get(backendId);
-      if (localProduct?._dirty) {
+      if (localProduct?._dirty && !authoritativeMraStock) {
         console.log('[InventorySync] Skipping overwrite for dirty local product:', backendId);
         continue;
       }
 
       const normalizedProduct = normalizeInventoryProduct(backendProduct, branchId, localProduct);
       if (!normalizedProduct) {
+        continue;
+      }
+
+      if (localProduct?._dirty && authoritativeMraStock) {
+        // An explicit EIS product pull is authoritative for the fields managed
+        // by MRA. Preserve local-only fields and pending sync flags so a local
+        // deletion or unrelated edit is not lost while refreshing the EIS data.
+        await db.inventory.update(backendId, {
+          name: normalizedProduct.name,
+          category: normalizedProduct.category,
+          itemType: normalizedProduct.itemType,
+          stockUnits: normalizedProduct.stockUnits,
+          stock_units: normalizedProduct.stockUnits,
+          unitType: normalizedProduct.unitType,
+          reorderLevel: normalizedProduct.reorderLevel,
+          status: normalizedProduct.status,
+          price: normalizedProduct.price,
+          value: normalizedProduct.value,
+          isVariablePrice: normalizedProduct.isVariablePrice,
+          isFuel: normalizedProduct.isFuel,
+          isOil: normalizedProduct.isOil,
+          productCode: normalizedProduct.productCode,
+          barcode: normalizedProduct.barcode,
+          sku: normalizedProduct.sku,
+          expiry: normalizedProduct.expiry,
+          onMenu: normalizedProduct.onMenu,
+          isProduced: normalizedProduct.isProduced,
+          isSoldInPortions: normalizedProduct.isSoldInPortions,
+          portionName: normalizedProduct.portionName,
+          portionsPerUnit: normalizedProduct.portionsPerUnit,
+          _synced_at: new Date().toISOString(),
+        });
+        updated++;
         continue;
       }
 
@@ -366,20 +486,12 @@ export async function syncInventoryFromBackend(branchId: string): Promise<{
 
     console.log('[InventorySync] Synced products:', products.length, 'created:', created, 'updated:', updated);
 
-    // CRITICAL: Also fetch and sync MRA mappings
-    // IMPORTANT: Clear old mappings first to ensure approval status changes are reflected
+    // Store fresh MRA mappings in one IndexedDB transaction.
     let mraMappingsSynced = 0;
     try {
-      console.log('[InventorySync] Fetching MRA mappings for branch:', backendBranchId);
-
-      const mraMappings = await fetchPaginatedResults<any>(
-        `/inventory/mra-mappings/?branch_id=${backendBranchId}`,
-        'inventory MRA mappings'
-      );
-
       console.log('[InventorySync] Received MRA mappings:', mraMappings.length);
+      const mappingsToStore: any[] = [];
 
-      // Store each MRA mapping in local database with fresh data from backend
       for (const mapping of mraMappings) {
         try {
           // Convert snake_case to camelCase
@@ -424,17 +536,16 @@ export async function syncInventoryFromBackend(branchId: string): Promise<{
 
           delete (mappingToStore as any).inventoryItem;
 
-          console.log('[InventorySync] Storing MRA mapping:', mappingToStore.id, 'for product:', mappingToStore.inventoryItemId, 'approved:', mappingToStore.isApproved, 'synced:', mappingToStore.mraSynced);
-
-          await db.mraMappings.put(mappingToStore);
-          
-          mraMappingsSynced++;
-          console.log('[InventorySync] ✓ Stored MRA mapping for product:', mappingToStore.inventoryItemId, 'approved:', mappingToStore.isApproved);
+          mappingsToStore.push(mappingToStore);
         } catch (error) {
           console.error('[InventorySync] Error storing MRA mapping:', mapping.id, error);
         }
       }
 
+      if (mappingsToStore.length > 0) {
+        await db.mraMappings.bulkPut(mappingsToStore);
+      }
+      mraMappingsSynced = mappingsToStore.length;
       console.log('[InventorySync] Successfully synced', mraMappingsSynced, 'MRA mappings');
       recordMraMappingCacheRefresh(branchId, {
         inventoryItemCount: mraMappings.length,
@@ -475,6 +586,17 @@ export async function refreshInventoryFromMraApprovedProducts(
   synced: number;
   mraMappingsSynced?: number;
   stockReconciliationWarnings?: StockReconciliationWarning[];
+  skippedProducts?: Array<{
+    mra_product_code?: string;
+    name?: string;
+    fields?: string[];
+  }>;
+  taxpayerIncompatible?: Array<{
+    mra_product_code?: string;
+    name?: string;
+    error?: string;
+  }>;
+  notImportedCount?: number;
   error?: string;
 }> {
   const normalizedBranchId = toBackendBranchId(branchId);
@@ -511,6 +633,16 @@ export async function refreshInventoryFromMraApprovedProducts(
         body: JSON.stringify({ refreshFromMra: options.refreshFromMra !== false }),
       }
     );
+    const skippedProducts = Array.isArray(pullResponse?.skipped_invalid_products)
+      ? pullResponse.skipped_invalid_products
+      : [];
+    const taxpayerIncompatible = Array.isArray(pullResponse?.taxpayer_incompatible)
+      ? pullResponse.taxpayer_incompatible
+      : [];
+    const notImportedCount = Math.max(
+      0,
+      Number(pullResponse?.product_count ?? 0) - Number(pullResponse?.imported_product_count ?? 0)
+    );
 
     if (options.syncLocal === false) {
       return {
@@ -518,10 +650,18 @@ export async function refreshInventoryFromMraApprovedProducts(
         created: Number(pullResponse?.created ?? 0),
         updated: Number(pullResponse?.updated ?? 0),
         synced: 0,
+        skippedProducts,
+        taxpayerIncompatible,
+        notImportedCount,
       };
     }
 
-    const syncResult = await syncInventoryFromBackend(branchId);
+    const syncResult = await syncInventoryFromBackend(branchId, {
+      authoritativeMraStock: true,
+      mraMappings: Array.isArray(pullResponse?.mra_mappings)
+        ? pullResponse.mra_mappings
+        : undefined,
+    });
     if (syncResult.error) {
       return {
         ok: false,
@@ -530,6 +670,9 @@ export async function refreshInventoryFromMraApprovedProducts(
         synced: syncResult.synced,
         mraMappingsSynced: syncResult.mraMappingsSynced,
         stockReconciliationWarnings: syncResult.stockReconciliationWarnings,
+        skippedProducts,
+        taxpayerIncompatible,
+        notImportedCount,
         error: syncResult.error,
       };
     }
@@ -541,6 +684,9 @@ export async function refreshInventoryFromMraApprovedProducts(
       synced: syncResult.synced,
       mraMappingsSynced: syncResult.mraMappingsSynced,
       stockReconciliationWarnings: syncResult.stockReconciliationWarnings,
+      skippedProducts,
+      taxpayerIncompatible,
+      notImportedCount,
     };
   } catch (error) {
     console.error('[InventorySync] Failed to refresh MRA approved products:', error);

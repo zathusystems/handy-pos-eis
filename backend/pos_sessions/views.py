@@ -89,24 +89,26 @@ def _apply_branch_filter(queryset, branch_reference, field_name='branch'):
 
 def _enforce_mra_submission_policy(order, business_settings, mra_result):
     """
-    Enforce MRA live-mode blocking rule when EIS is unreachable.
+    Enforce MRA submission policy for a POS order.
 
-    If block_sales_if_eis_down is enabled, a sale must not complete unless
-    MRA submission is confirmed in live mode.
+    A confirmed MRA rejection is always fatal: the local POS order must not
+    survive when MRA has rejected the fiscal transaction.  Connectivity and
+    server failures continue to follow block_sales_if_eis_down.
     """
-    if not getattr(settings, 'MRA_EIS_IS_LIVE', False):
-        return
     if not business_settings:
         return
     if not bool(getattr(business_settings, 'enable_eis', False)):
         return
-    if not bool(getattr(business_settings, 'block_sales_if_eis_down', True)):
-        return
 
     if not isinstance(mra_result, dict):
+        if not getattr(settings, 'MRA_EIS_IS_LIVE', False):
+            return
+        if not bool(getattr(business_settings, 'block_sales_if_eis_down', True)):
+            return
         raise ValidationError(
             {
                 'error': 'MRA EIS submission did not return a valid response. Sale blocked by compliance policy.',
+                'reason': 'eis_submission_blocked',
                 'mra_submission': {
                     'state': 'invalid_response',
                     'message': 'MRA EIS submission did not return a valid response.',
@@ -127,6 +129,24 @@ def _enforce_mra_submission_policy(order, business_settings, mra_result):
         'errors': mra_result.get('errors') or [],
     }
     endpoint_key = str(mra_result.get('endpoint') or '').strip().lower()
+    eis_status = str(mra_result.get('eis_status') or '').strip().upper()
+
+    if submission_state.lower() == 'rejected' or eis_status == 'REJECTED':
+        message = submission_message or 'MRA rejected the fiscal sale.'
+        raise ValidationError(
+            {
+                'error': f'{message} Sale was not created in the POS because MRA rejected it.',
+                'reason': 'eis_rejected',
+                'eis_status': 'REJECTED',
+                'order_id': str(order.id),
+                'mra_submission': submission_payload,
+            }
+        )
+
+    if not getattr(settings, 'MRA_EIS_IS_LIVE', False):
+        return
+    if not bool(getattr(business_settings, 'block_sales_if_eis_down', True)):
+        return
 
     response_payload = mra_result.get('response')
     reason = 'eis_unreachable'
@@ -146,18 +166,19 @@ def _enforce_mra_submission_policy(order, business_settings, mra_result):
         raise ValidationError(
             {
                 'error': f'{message} Sale blocked by compliance policy (block_sales_if_eis_down).',
-                'reason': reason,
+                'reason': 'eis_submission_blocked',
+                'mra_reason': reason,
                 'order_id': str(order.id),
                 'mra_submission': submission_payload,
             }
         )
 
-    eis_status = str(mra_result.get('eis_status') or '').upper()
     if eis_status != 'SUBMITTED':
         message = submission_message or 'MRA EIS did not confirm submission.'
         raise ValidationError(
             {
                 'error': f'{message} Sale blocked by compliance policy (block_sales_if_eis_down).',
+                'reason': 'eis_submission_blocked',
                 'eis_status': eis_status or 'UNKNOWN',
                 'order_id': str(order.id),
                 'mra_submission': submission_payload,
@@ -257,6 +278,7 @@ class OrderViewSet(viewsets.ModelViewSet):
         
         return queryset
 
+    @transaction.atomic
     def create(self, request, *args, **kwargs):
         """
         Create order and apply backend stock movement using FIFO.
@@ -355,10 +377,9 @@ class OrderViewSet(viewsets.ModelViewSet):
             traceback.print_exc()
             raise
 
-        # Run MRA EIS outside the local POS stock/order transaction. The MRA
-        # pipeline has its own transaction handling and may queue offline
-        # receipts; keeping it separate prevents MRA/receipt failures from
-        # poisoning the local order transaction with TransactionManagementError.
+        # The local save uses its own savepoint, while this method-level
+        # transaction remains open through EIS preparation. A confirmed MRA
+        # rejection therefore rolls back the order, items, and FIFO movement.
         try:
             try:
                 business_settings = order.business.settings
@@ -396,17 +417,23 @@ class OrderViewSet(viewsets.ModelViewSet):
                 MRAIntegrationError = Exception
 
             if isinstance(mra_exc, MRAIntegrationError):
-                raise ValidationError(
-                    {
-                        'error': str(mra_exc),
-                        'mra_submission': {
-                            'state': 'failed_before_submission',
-                            'message': str(mra_exc),
-                            'retryable': False,
-                        },
-                        'order_id': str(order.id),
-                    }
-                )
+                is_fiscal_rejection = str(getattr(mra_exc, 'reason', '') or '').strip().lower() == 'eis_rejected'
+                error_payload = {
+                    'error': str(mra_exc),
+                    'mra_submission': {
+                        'state': 'rejected' if is_fiscal_rejection else 'failed_before_submission',
+                        'message': str(mra_exc),
+                        'retryable': False,
+                        'eis_status': 'REJECTED' if is_fiscal_rejection else '',
+                    },
+                    'order_id': str(order.id),
+                }
+                if is_fiscal_rejection:
+                    error_payload.update({'reason': 'eis_rejected', 'eis_status': 'REJECTED'})
+                    error_payload['error'] = (
+                        f'{str(mra_exc)} Sale was not created in the POS because EIS rejected it.'
+                    )
+                raise ValidationError(error_payload)
 
             if bool(getattr(business_settings, 'enable_eis', False)):
                 raise ValidationError(

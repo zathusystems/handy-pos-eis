@@ -11,9 +11,11 @@ import {
   FilePlus2,
   FileMinus2,
   Ban,
+  Download,
 } from 'lucide-react';
 
 import { db, type Order, type Business } from '@/lib/db';
+import { resolveEisSubmissionFailureReason } from '@/lib/eis-submission';
 import { useCurrency } from '@/hooks/use-currency';
 import { useAuth } from '@/hooks/use-auth';
 import { authFetch } from '@/lib/auth-fetch';
@@ -50,6 +52,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Receipt } from '@/components/pos/receipt';
+import { exportThermalReceiptPdf } from '@/lib/thermal-receipt-pdf';
 import { VoidModal } from './void-modal';
 import { CreditNoteModal } from './credit-note-modal';
 import { DebitNoteModal } from './debit-note-modal';
@@ -292,6 +295,7 @@ export default function SaleDetailModal({ order, isOpen, onOpenChange }: { order
   const [debitNotes, setDebitNotes] = useState<DebitNote[]>([]);
   const [loadingCorrections, setLoadingCorrections] = useState(false);
   const [isPrinting, setIsPrinting] = useState(false);
+  const [isExportingReceiptPdf, setIsExportingReceiptPdf] = useState(false);
   const [businessSettings, setBusinessSettings] = useState<Business | null>(null);
   const [inventoryUnitById, setInventoryUnitById] = useState<Record<string, string>>({});
   const [receiptPaperWidth, setReceiptPaperWidth] = useState<PrinterPaperWidth>('80mm');
@@ -505,6 +509,8 @@ export default function SaleDetailModal({ order, isOpen, onOpenChange }: { order
   );
   const eisStatusDisplay = normalizeFiscalStatus((order as any).eisStatus ?? (order as any).eis_status);
   const fiscalReceiptStatusText = formatFiscalReceiptStatus(eisStatusDisplay);
+  const eisFailureReason = resolveEisSubmissionFailureReason(order);
+  const orderSyncStatus = toTrimmedString((order as any).syncStatus ?? (order as any).sync_status).toLowerCase();
 
   const isVoided = order.status === 'Voided' || order.status === 'Cancelled' || Boolean(voidTransaction);
   const isFiscalLocked = Boolean((order as any).is_fiscal_locked ?? (order as any).isFiscalLocked);
@@ -740,6 +746,45 @@ export default function SaleDetailModal({ order, isOpen, onOpenChange }: { order
     }
   };
 
+  const handleExportReceiptPdf = async () => {
+    if (!order) {
+      return;
+    }
+
+    try {
+      setIsExportingReceiptPdf(true);
+      setReceiptCopyNumber(1);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      const orderNumber = String(
+        (order as any).fiscalInvoiceNumber ??
+        (order as any).fiscal_invoice_number ??
+        (order as any).orderNumber ??
+        (order as any).order_number ??
+        'receipt'
+      ).trim();
+      const result = await exportThermalReceiptPdf({
+        elementId: 'receipt-printable-area',
+        paperWidth: receiptPaperWidth,
+        filename: `handypos-receipt-${orderNumber}`,
+      });
+      toast({
+        title: 'Receipt PDF Exported',
+        description: result.location === 'tauri'
+          ? `Saved to ${result.path}`
+          : `${result.filename} downloaded.`,
+      });
+    } catch (error) {
+      console.error('[Receipt PDF] Export failed:', error);
+      toast({
+        variant: 'destructive',
+        title: 'PDF Export Failed',
+        description: 'Could not export the thermal receipt PDF.',
+      });
+    } finally {
+      setIsExportingReceiptPdf(false);
+    }
+  };
+
   return (
     <>
       <Dialog open={isOpen} onOpenChange={onOpenChange}>
@@ -761,6 +806,16 @@ export default function SaleDetailModal({ order, isOpen, onOpenChange }: { order
               >
                 <Printer className="mr-2 h-4 w-4" />
                 {isPrinting ? 'Printing...' : 'Print'}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 flex-1 sm:h-9 sm:flex-none"
+                onClick={handleExportReceiptPdf}
+                disabled={isExportingReceiptPdf}
+              >
+                <Download className="mr-2 h-4 w-4" />
+                {isExportingReceiptPdf ? 'Exporting...' : 'PDF'}
               </Button>
               {!isVoided && isAdminUser && (
                 <DropdownMenu>
@@ -1087,12 +1142,19 @@ export default function SaleDetailModal({ order, isOpen, onOpenChange }: { order
             )}
 
             {/* MRA EIS Status */}
-            {eisStatusDisplay && (
+            {(eisStatusDisplay || eisFailureReason || orderSyncStatus === 'failed') && (
               <div className="bg-blue-500/10 dark:bg-blue-500/20 p-3 rounded-md border border-blue-500/30">
                 <p className="text-sm text-muted-foreground">Fiscal Receipt Submission</p>
-                <p className="font-semibold text-blue-700 dark:text-blue-300">{fiscalReceiptStatusText}</p>
+                <p className={`font-semibold ${eisFailureReason ? 'text-red-700 dark:text-red-300' : 'text-blue-700 dark:text-blue-300'}`}>
+                  {eisStatusDisplay ? fiscalReceiptStatusText : 'Fiscal receipt submission failed'}
+                </p>
                 {fiscalInvoiceNumber && (
                   <p className="text-xs text-muted-foreground mt-1">Original fiscal receipt: {fiscalInvoiceNumber}</p>
+                )}
+                {eisFailureReason && (
+                  <p className="text-xs text-red-700 dark:text-red-300 mt-1">
+                    Reason: {eisFailureReason}
+                  </p>
                 )}
                 {eisStatusDisplay === 'PENDING' && (
                   <p className="text-xs text-blue-700/80 dark:text-blue-300 mt-1">

@@ -70,7 +70,7 @@ export function ViewOrdersModal({ branchId, isOpen, onOpenChange }: ViewOrdersMo
   const allOrders = useLiveQuery(
     () => {
       if (!branchId) {
-        console.log('[ViewOrdersModal] No branchId provided');
+
         return [];
       }
       const normalizedBranchId = normalizeBranchId(branchId);
@@ -79,11 +79,6 @@ export function ViewOrdersModal({ branchId, isOpen, onOpenChange }: ViewOrdersMo
           const filteredOrders = orders.filter(
             (order) => normalizeBranchId(order.branchId) === normalizedBranchId
           );
-
-          console.log('[ViewOrdersModal] Fetched orders for branch:', normalizedBranchId, filteredOrders.length);
-          if (filteredOrders.length > 0) {
-            console.log('[ViewOrdersModal] First order:', filteredOrders[0]);
-          }
           return filteredOrders.sort((a, b) => {
             // Sort by created date, newest first
             if (!a.createdAt || !b.createdAt) return 0;
@@ -97,7 +92,7 @@ export function ViewOrdersModal({ branchId, isOpen, onOpenChange }: ViewOrdersMo
   // Fetch orders from backend when modal opens
   React.useEffect(() => {
     if (isOpen && branchId) {
-      console.log('[ViewOrdersModal] Modal opened, fetching orders from backend');
+
       const { syncService } = require('@/lib/services/sync-service');
       syncService.fetchAllTakeOrdersFromBackend(branchId);
     }
@@ -169,7 +164,7 @@ export function ViewOrdersModal({ branchId, isOpen, onOpenChange }: ViewOrdersMo
 
   const handleUpdateStatus = async (orderId: string, newStatus: string) => {
     try {
-      console.log(`[ViewOrdersModal] Updating order ${orderId} to status: ${newStatus}`);
+
       const backendBranchId = branchId.replace(/^BRN-/, '');
       
       const response = await fetch(
@@ -185,7 +180,7 @@ export function ViewOrdersModal({ branchId, isOpen, onOpenChange }: ViewOrdersMo
       );
 
       if (response.ok) {
-        console.log(`[ViewOrdersModal] Order ${orderId} updated to ${newStatus}`);
+
         // Refresh orders from backend
         const { syncService } = require('@/lib/services/sync-service');
         syncService.fetchAllTakeOrdersFromBackend(branchId);

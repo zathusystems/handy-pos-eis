@@ -2138,6 +2138,20 @@ class ConfigurationService:
         return taxpayer_config if isinstance(taxpayer_config, dict) else {}
 
     @staticmethod
+    def get_configured_tax_rates(business) -> list[dict[str, Any]]:
+        """Return the tax-rate definitions from the latest official MRA config."""
+        bundle = ConfigurationService.get_official_configuration_bundle(business)
+        global_config = bundle.get('globalConfiguration')
+        if not isinstance(global_config, dict):
+            return []
+
+        for key in ('taxrates', 'taxRates', 'tax_rates', 'taxRateDefinitions', 'tax_rate_definitions'):
+            tax_rates = global_config.get(key)
+            if isinstance(tax_rates, list):
+                return [rate for rate in tax_rates if isinstance(rate, dict)]
+        return []
+
+    @staticmethod
     def get_activated_tax_rate_ids(business) -> list[str]:
         taxpayer_config = ConfigurationService.get_taxpayer_configuration(business)
         raw_ids = (
@@ -2213,45 +2227,40 @@ class ConfigurationService:
             if taxpayer_rate_id:
                 return taxpayer_rate_id
 
-        bundle = ConfigurationService.get_official_configuration_bundle(business)
-        global_config = bundle.get('globalConfiguration')
-        tax_rates = global_config.get('taxrates') if isinstance(global_config, dict) else []
-        if isinstance(tax_rates, list):
-            if category in {'zero', 'vat_zero', 'zero_rated', 'exempt', 'vat_exempt'}:
-                preferred_ids = ['B'] if category in {'zero', 'vat_zero', 'zero_rated'} else ['E']
-                preferred_words = (
-                    ['zero', 'zero rated', 'zero-rated']
-                    if category in {'zero', 'vat_zero', 'zero_rated'}
-                    else ['exempt']
-                )
-                for tax_rate_node in tax_rates:
-                    if not isinstance(tax_rate_node, dict):
-                        continue
-                    candidate_id = str(tax_rate_node.get('id') or '').strip()
-                    candidate_name = str(tax_rate_node.get('name') or '').strip().lower()
-                    try:
-                        candidate_rate = Decimal(str(tax_rate_node.get('rate') or 0)).quantize(Decimal('0.001'))
-                    except (InvalidOperation, TypeError, ValueError):
-                        continue
-                    if candidate_rate != Decimal('0.000'):
-                        continue
-                    if (
-                        ConfigurationService._normalize_tax_rate_id(candidate_id)
-                        in {ConfigurationService._normalize_tax_rate_id(rate_id) for rate_id in preferred_ids}
-                    ) or any(word in candidate_name for word in preferred_words):
-                        return candidate_id or preferred_ids[0]
-
+        tax_rates = ConfigurationService.get_configured_tax_rates(business)
+        if category in {'zero', 'vat_zero', 'zero_rated', 'exempt', 'vat_exempt'}:
+            preferred_ids = ['B'] if category in {'zero', 'vat_zero', 'zero_rated'} else ['E']
+            preferred_words = (
+                ['zero', 'zero rated', 'zero-rated']
+                if category in {'zero', 'vat_zero', 'zero_rated'}
+                else ['exempt']
+            )
             for tax_rate_node in tax_rates:
-                if not isinstance(tax_rate_node, dict):
-                    continue
+                candidate_id = str(
+                    tax_rate_node.get('id') or tax_rate_node.get('rateId') or ''
+                ).strip()
+                candidate_name = str(tax_rate_node.get('name') or '').strip().lower()
                 try:
                     candidate_rate = Decimal(str(tax_rate_node.get('rate') or 0)).quantize(Decimal('0.001'))
                 except (InvalidOperation, TypeError, ValueError):
                     continue
-                if candidate_rate == normalized_rate:
-                    candidate_id = tax_rate_node.get('id')
-                    if candidate_id not in (None, ''):
-                        return str(candidate_id)
+                if candidate_rate != Decimal('0.000'):
+                    continue
+                if (
+                    ConfigurationService._normalize_tax_rate_id(candidate_id)
+                    in {ConfigurationService._normalize_tax_rate_id(rate_id) for rate_id in preferred_ids}
+                ) or any(word in candidate_name for word in preferred_words):
+                    return candidate_id or preferred_ids[0]
+
+        for tax_rate_node in tax_rates:
+            try:
+                candidate_rate = Decimal(str(tax_rate_node.get('rate') or 0)).quantize(Decimal('0.001'))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if candidate_rate == normalized_rate:
+                candidate_id = tax_rate_node.get('id') or tax_rate_node.get('rateId')
+                if candidate_id not in (None, ''):
+                    return str(candidate_id)
 
         if category in {'zero', 'vat_zero', 'zero_rated'}:
             return 'B'
@@ -3127,30 +3136,26 @@ class ProductMappingService:
         return ProductMappingService.normalize_levies(raw_levies, business=business)
 
     @staticmethod
-    def _tax_details_from_rate_id(business, rate_id: Any) -> tuple[str, Decimal]:
+    def _tax_details_from_rate_id(business, rate_id: Any) -> tuple[str, Decimal] | None:
         normalized_id = str(rate_id or '').strip()
         if normalized_id.upper() in {'E', 'EXEMPT'}:
             return 'exempt', Decimal('0.00')
-        if normalized_id.upper() in {'Z', 'ZERO', 'NRT', 'NON_RATED', 'NONRATED', 'NON-RATED'}:
+        if normalized_id.upper() in {'B', 'Z', 'ZERO', 'NRT', 'NON_RATED', 'NONRATED', 'NON-RATED'}:
             return 'zero', Decimal('0.00')
 
-        bundle = ConfigurationService.get_official_configuration_bundle(business) if business else {}
-        global_config = bundle.get('globalConfiguration')
-        tax_rates = global_config.get('taxrates') if isinstance(global_config, dict) else []
-        if isinstance(tax_rates, list):
-            for tax_rate_node in tax_rates:
-                if not isinstance(tax_rate_node, dict):
-                    continue
-                candidate_id = str(tax_rate_node.get('id') or tax_rate_node.get('rateId') or '').strip()
-                if candidate_id and normalized_id and candidate_id.upper() != normalized_id.upper():
-                    continue
-                try:
-                    rate = Decimal(str(tax_rate_node.get('rate') or 0)).quantize(Decimal('0.01'))
-                except (InvalidOperation, TypeError, ValueError):
-                    continue
-                return ('zero' if rate == Decimal('0.00') else 'standard'), rate
+        for tax_rate_node in ConfigurationService.get_configured_tax_rates(business):
+            candidate_id = str(
+                tax_rate_node.get('id') or tax_rate_node.get('rateId') or ''
+            ).strip()
+            if candidate_id and normalized_id and candidate_id.upper() != normalized_id.upper():
+                continue
+            try:
+                rate = Decimal(str(tax_rate_node.get('rate') or 0)).quantize(Decimal('0.01'))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            return ('zero' if rate == Decimal('0.00') else 'standard'), rate
 
-        return 'standard', Decimal('16.50')
+        return None
 
     @staticmethod
     def _catalog_decimal(
@@ -3231,16 +3236,25 @@ class ProductMappingService:
             'default_tax_rate', 'defaultTaxRate', 'tax_rate', 'taxRate', 'vat_rate', 'vatRate',
         ])
         catalog_validation_errors: list[str] = []
+        tax_data_complete = True
         if raw_tax_rate is None and tax_rate_id not in (None, ''):
-            tax_type, tax_rate = ProductMappingService._tax_details_from_rate_id(business, tax_rate_id)
+            tax_details = ProductMappingService._tax_details_from_rate_id(business, tax_rate_id)
+            if tax_details is None:
+                catalog_validation_errors.append('tax_rate_id')
+                tax_data_complete = False
+                tax_rate = Decimal('0.00')
+            else:
+                tax_type, tax_rate = tax_details
         else:
             tax_rate = ProductMappingService._catalog_decimal(
-                raw_tax_rate if raw_tax_rate is not None else (0 if tax_type in {'zero', 'exempt'} else 16.5),
+                raw_tax_rate if raw_tax_rate is not None else 0,
                 '0.01',
                 max_digits=5,
                 invalid_fields=catalog_validation_errors,
                 field_name='tax_rate',
             )
+            if raw_tax_rate is None and tax_type == 'standard':
+                tax_data_complete = False
         tax_rate = ProductMappingService._catalog_decimal(
             tax_rate,
             '0.01',
@@ -3312,6 +3326,7 @@ class ProductMappingService:
             'tax_type': tax_type,
             'tax_rate': tax_rate,
             'tax_rate_id': str(tax_rate_id or '').strip(),
+            'tax_data_complete': tax_data_complete,
             'tax_adjusted_for_non_vat': tax_adjusted_for_non_vat,
             'unit_measure': str(ProductMappingService._catalog_first(item, [
                 'unit', 'unitMeasure', 'unit_measure', 'unitOfMeasure', 'mra_unit_measure',
@@ -3647,15 +3662,23 @@ class ProductMappingService:
                     'mra_product_code': display_code,
                     'mra_product_name': ProductMappingService._catalog_sale_description(product) or str(product.get('name') or item.name).strip() or item.name,
                     'mra_tax_type': product.get('tax_type') or 'standard',
-                    'mra_tax_rate': product.get('tax_rate') or Decimal('16.50'),
+                    'mra_tax_rate': (
+                        product.get('tax_rate')
+                        if product.get('tax_rate') is not None
+                        else Decimal('0.00')
+                    ),
                     'mra_unit_measure': unit_measure[:20] or 'unit',
                     'tax_calculation_method': product.get('tax_calculation_method') or 'inclusive',
                     'mra_levies': product.get('levies') or [],
                     'is_product': bool(product.get('is_product', True)),
-                    'is_approved': True,
-                    'approved_at': getattr(item, 'mra_mapping', None).approved_at if hasattr(item, 'mra_mapping') and item.mra_mapping.approved_at else now,
-                    'mra_synced': True,
-                    'last_synced_at': now,
+                    'is_approved': bool(product.get('is_approved')) and bool(product.get('tax_data_complete', True)),
+                    'approved_at': (
+                        getattr(item, 'mra_mapping', None).approved_at
+                        if hasattr(item, 'mra_mapping') and item.mra_mapping.approved_at
+                        else now
+                    ) if bool(product.get('is_approved')) and bool(product.get('tax_data_complete', True)) else None,
+                    'mra_synced': bool(product.get('is_approved')) and bool(product.get('tax_data_complete', True)),
+                    'last_synced_at': now if bool(product.get('is_approved')) and bool(product.get('tax_data_complete', True)) else None,
                 },
             )
             if mapping_created:
@@ -5794,6 +5817,24 @@ class InvoiceService:
     """Invoice creation and MRA submission for standalone MRAInvoice flow."""
 
     @staticmethod
+    def _ensure_terminal_can_issue_invoice(terminal: Terminal, *, check_mra_block: bool = True) -> None:
+        """Apply the same active/unblocked terminal policy as POS sales."""
+        if not terminal or terminal.status != 'active':
+            current_status = getattr(terminal, 'status', 'missing') if terminal else 'missing'
+            raise MRAIntegrationError(
+                f'MRA terminal is not active for fiscal invoices (current status: {current_status}). '
+                'Activate or unblock the terminal before processing EIS sales.'
+            )
+
+        live_submission = (
+            bool(getattr(settings, 'MRA_EIS_ENABLE_HTTP_CALLS', False))
+            and not bool(getattr(settings, 'MRA_EIS_DRY_RUN', True))
+            and bool(getattr(settings, 'MRA_EIS_ALLOW_LIVE_SUBMISSION', False))
+        )
+        if check_mra_block and live_submission and getattr(settings, 'MRA_EIS_CHECK_TERMINAL_BLOCK_BEFORE_SALE', True):
+            TerminalService.ensure_terminal_not_blocked_for_sale(terminal)
+
+    @staticmethod
     def _to_json_safe(value: Any) -> Any:
         if isinstance(value, Decimal):
             return str(value)
@@ -6556,8 +6597,29 @@ class InvoiceService:
         return net_amount, tax_amount, gross_amount, tax_breakdown
 
     @staticmethod
-    @transaction.atomic
     def create_invoice(
+        terminal,
+        seller_tin,
+        seller_name,
+        items,
+        buyer_tin=None,
+        buyer_name=None,
+        is_online=True,
+    ):
+        InvoiceService._ensure_terminal_can_issue_invoice(terminal)
+        return InvoiceService._create_invoice_atomic(
+            terminal=terminal,
+            seller_tin=seller_tin,
+            seller_name=seller_name,
+            items=items,
+            buyer_tin=buyer_tin,
+            buyer_name=buyer_name,
+            is_online=is_online,
+        )
+
+    @staticmethod
+    @transaction.atomic
+    def _create_invoice_atomic(
         terminal,
         seller_tin,
         seller_name,
@@ -6939,8 +7001,13 @@ class InvoiceService:
         return True
 
     @staticmethod
-    @transaction.atomic
     def submit_invoice(invoice):
+        InvoiceService._ensure_terminal_can_issue_invoice(invoice.terminal)
+        return InvoiceService._submit_invoice_atomic(invoice)
+
+    @staticmethod
+    @transaction.atomic
+    def _submit_invoice_atomic(invoice):
         endpoint_key = 'report_sale' if invoice.is_online else 'report_sale_offline'
         payload = InvoiceService._build_mra_invoice_payload(invoice)
 
@@ -7023,8 +7090,13 @@ class InvoiceService:
             raise
 
     @staticmethod
+    def queue_offline_invoice(invoice, *, check_mra_block: bool = True):
+        InvoiceService._ensure_terminal_can_issue_invoice(invoice.terminal, check_mra_block=check_mra_block)
+        return InvoiceService._queue_offline_invoice_atomic(invoice)
+
+    @staticmethod
     @transaction.atomic
-    def queue_offline_invoice(invoice):
+    def _queue_offline_invoice_atomic(invoice):
         if invoice.is_online:
             raise ValueError('Cannot queue online invoice')
 
@@ -8079,6 +8151,28 @@ class POSOrderSubmissionService:
         enforce_device_binding: bool = False,
         check_mra_block: bool = True,
     ) -> None:
+        should_check_block = (
+            check_mra_block
+            and getattr(settings, 'MRA_EIS_CHECK_TERMINAL_BLOCK_BEFORE_SALE', True)
+        )
+        if (
+            terminal.status == 'suspended'
+            and should_check_block
+            and bool(getattr(settings, 'MRA_EIS_ENABLE_HTTP_CALLS', False))
+            and not bool(getattr(settings, 'MRA_EIS_DRY_RUN', True))
+            and bool(getattr(settings, 'MRA_EIS_ALLOW_LIVE_SUBMISSION', False))
+            and str(getattr(terminal, 'mra_token', '') or '').strip()
+        ):
+            try:
+                TerminalService.check_terminal_unblock_status(terminal)
+                terminal.refresh_from_db()
+            except MRAIntegrationError as exc:
+                logger.info(
+                    'Automatic MRA terminal unblock check could not complete for %s: %s',
+                    terminal.terminal_id,
+                    exc,
+                )
+
         if terminal.status != 'active':
             raise MRAIntegrationError(
                 f'MRA terminal is not active for sales (current status: {terminal.status}). '
@@ -8154,7 +8248,9 @@ class POSOrderSubmissionService:
             f'MRA site product "{product_code}" for "{getattr(item, "name", "Unknown")}" is configured in EIS as '
             f'{catalog_type} VAT ({catalog_rate}%), but the local POS mapping is {mapping_type} VAT ({mapping_rate}%). '
             'Update the product tax in the MRA EIS portal and pull approved products again, or activate VAT registration '
-            'before selling this item.'
+            'before selling this item.',
+            reason='eis_rejected',
+            response_data={'reason': 'mra_validation_rejected'},
         )
 
     @staticmethod
@@ -9243,7 +9339,7 @@ class POSOrderSubmissionService:
         queue_entry = None
         if (not is_online) and result.dry_run:
             # Persist offline transaction for ordered replay when connectivity returns.
-            queue_entry = InvoiceService.queue_offline_invoice(mra_invoice)
+            queue_entry = InvoiceService.queue_offline_invoice(mra_invoice, check_mra_block=False)
 
         submission_diagnostic = POSOrderSubmissionService._build_sale_submission_diagnostic(
             result=result,

@@ -167,12 +167,6 @@ export const TakeOrdersPanel = ({
   const { format: formatCurrency } = useCurrency();
   const [isOpen, setIsOpen] = useState(false);
 
-  // First, get all take orders to debug
-  const allTakeOrders = useLiveQuery(
-    () => db.takeOrders.toArray(),
-    []
-  );
-
   const readyTakeOrders = useLiveQuery(
     async () => {
       if (!branchId) return [];
@@ -180,26 +174,26 @@ export const TakeOrdersPanel = ({
       // Using toArray() instead of where() to avoid branchId type mismatch issues
       const allOrders = await db.takeOrders.toArray();
       const normalizedQueryBranchId = normalizeBranchId(branchId);
-      console.log('[TakeOrdersPanel Query] All take orders in DB:', allOrders);
+
       const ordersForBranch = allOrders.filter((order) => {
         const orderBranchId = normalizeBranchId(order.branchId);
         const queryBranchId = normalizedQueryBranchId;
-        console.log('[TakeOrdersPanel Query] Comparing branchIds:', { orderBranchId, queryBranchId, match: orderBranchId === queryBranchId });
+
         return orderBranchId === queryBranchId;
       });
-      console.log('[TakeOrdersPanel Query] Orders for branch:', ordersForBranch);
+
       
       // Ensure all take orders are marked as synced (not dirty) so they display
       // This handles take orders that were created locally but not yet synced
       for (const order of ordersForBranch) {
         if (order._dirty !== false) {
-          console.log('[TakeOrdersPanel] Marking take order as synced:', order.id);
+
           await db.takeOrders.update(order.id, { _dirty: false, _synced_at: new Date().toISOString() });
         }
       }
       
       const ready = ordersForBranch.filter((order) => order.status === 'Ready');
-      console.log('[TakeOrdersPanel Query] Filtered ready orders:', ready);
+
       return ready;
     },
     [branchId]
@@ -208,50 +202,30 @@ export const TakeOrdersPanel = ({
   // Fetch take orders from backend when component mounts or branchId changes
   useEffect(() => {
     if (branchId) {
-      console.log('[TakeOrdersPanel] Fetching take orders from backend for branch:', branchId);
+
       syncService.fetchAllTakeOrdersFromBackend(branchId);
     }
   }, [branchId]);
 
-  // Debug logging
-  useEffect(() => {
-    console.log('[TakeOrdersPanel] branchId:', branchId);
-    console.log('[TakeOrdersPanel] allTakeOrders count:', allTakeOrders?.length);
-    if (allTakeOrders && allTakeOrders.length > 0) {
-      console.log('[TakeOrdersPanel] Sample order:', allTakeOrders[0]);
-    }
-    console.log('[TakeOrdersPanel] readyTakeOrders count:', readyTakeOrders?.length);
-    if (readyTakeOrders && readyTakeOrders.length > 0) {
-      console.log('[TakeOrdersPanel] Sample ready order:', readyTakeOrders[0]);
-    }
-  }, [branchId, readyTakeOrders, allTakeOrders]);
-
   const handleAddToCart = async (order: TakeOrder) => {
-    console.log('[TakeOrdersPanel] Adding order to cart:', order);
-    console.log('[TakeOrdersPanel] Order items:', order.items);
+
     
     // Add each item from the take order to the cart
     for (const item of order.items) {
-      console.log('[TakeOrdersPanel] Processing item:', item);
+
       
       // First, try to use the price from the take order item (from backend)
       const takeOrderPrice = (item as any).price || 0;
-      console.log('[TakeOrdersPanel] Take order item price:', takeOrderPrice);
+
       
       // Get the inventory item to get additional info
       const inventoryItem = await db.inventory.get(item.id);
-      console.log('[TakeOrdersPanel] Found inventory item:', inventoryItem);
+
       
       if (inventoryItem) {
         // Use take order price if available, otherwise use inventory price
         const price = takeOrderPrice > 0 ? takeOrderPrice : (inventoryItem.price || 0);
-        console.log('[TakeOrdersPanel] Adding to cart:', { 
-          item: inventoryItem.name, 
-          quantity: item.quantity, 
-          price: price,
-          source: takeOrderPrice > 0 ? 'take_order' : 'inventory',
-          takeOrderId: order.id
-        });
+
         onAddToCart(inventoryItem, item.quantity, price, undefined, order.id);
       } else {
         console.warn('[TakeOrdersPanel] Inventory item not found for:', item.id);
@@ -262,13 +236,7 @@ export const TakeOrdersPanel = ({
         if (itemByName) {
           // Use take order price if available, otherwise use inventory price
           const price = takeOrderPrice > 0 ? takeOrderPrice : (itemByName.price || 0);
-          console.log('[TakeOrdersPanel] Found item by name, adding to cart:', { 
-            item: itemByName.name, 
-            quantity: item.quantity, 
-            price: price,
-            source: takeOrderPrice > 0 ? 'take_order' : 'inventory',
-            takeOrderId: order.id
-          });
+
           onAddToCart(itemByName, item.quantity, price, undefined, order.id);
         } else {
           console.warn('[TakeOrdersPanel] Inventory item not found by ID or name:', item.id, item.name);
@@ -282,7 +250,7 @@ export const TakeOrdersPanel = ({
             branchId: branchId,
             price: takeOrderPrice,
           };
-          console.log('[TakeOrdersPanel] Creating temporary item for cart:', tempItem);
+
           onAddToCart(tempItem, item.quantity, takeOrderPrice, undefined, order.id);
         }
       }
@@ -290,9 +258,7 @@ export const TakeOrdersPanel = ({
     setIsOpen(false);
   };
 
-  console.log('[TakeOrdersPanel] Rendering - ready orders:', readyTakeOrders?.length || 0);
-
-  // Always render the button, even if no ready orders (for testing)
+  // Keep the button available even when there are no ready orders.
   const orderCount = readyTakeOrders?.length || 0;
 
   return (

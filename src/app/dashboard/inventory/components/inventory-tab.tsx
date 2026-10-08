@@ -9,6 +9,8 @@ import {
   PlusCircle,
   Upload,
   Download,
+  Loader2,
+  RefreshCw,
   Edit,
   History,
   Trash2,
@@ -152,6 +154,8 @@ interface InventoryTabProps {
     onEditItem: (item: InventoryItem) => void;
     onImport: () => void;
     onTransfer: () => void;
+    onSyncEisProducts?: () => void;
+    isSyncingEisProducts?: boolean;
     readOnly?: boolean;
 }
 
@@ -164,6 +168,8 @@ export function InventoryTab({
     onEditItem,
     onImport,
     onTransfer,
+    onSyncEisProducts,
+    isSyncingEisProducts = false,
     readOnly = false
 }: InventoryTabProps) {
     const { user } = useAuth();
@@ -629,6 +635,27 @@ export function InventoryTab({
                 {!readOnly && (
                     <Button onClick={onAddItem}>
                         <PlusCircle className="mr-2 h-4 w-4" /> Add Item
+                    </Button>
+                )}
+                {onSyncEisProducts && (
+                    <Button
+                        type="button"
+                        variant="outline"
+                        onClick={onSyncEisProducts}
+                        disabled={isSyncingEisProducts}
+                        className="whitespace-nowrap"
+                    >
+                        {isSyncingEisProducts ? (
+                            <>
+                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                Syncing EIS...
+                            </>
+                        ) : (
+                            <>
+                                <RefreshCw className="mr-2 h-4 w-4" />
+                                Sync EIS Products
+                            </>
+                        )}
                     </Button>
                 )}
                 {/* <Button variant="outline" onClick={onTransfer}>
