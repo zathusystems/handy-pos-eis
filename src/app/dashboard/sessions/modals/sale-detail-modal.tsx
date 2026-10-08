@@ -52,7 +52,13 @@ import {
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Receipt } from '@/components/pos/receipt';
-import { exportThermalReceiptPdf } from '@/lib/thermal-receipt-pdf';
+import {
+  canShareThermalReceiptPdf,
+  downloadThermalReceiptPdf,
+  generateThermalReceiptPdf,
+  shareThermalReceiptPdf,
+} from '@/lib/thermal-receipt-pdf';
+import { ReceiptPdfExportDialog } from '@/components/pos/receipt-pdf-export-dialog';
 import { VoidModal } from './void-modal';
 import { CreditNoteModal } from './credit-note-modal';
 import { DebitNoteModal } from './debit-note-modal';
@@ -296,6 +302,7 @@ export default function SaleDetailModal({ order, isOpen, onOpenChange }: { order
   const [loadingCorrections, setLoadingCorrections] = useState(false);
   const [isPrinting, setIsPrinting] = useState(false);
   const [isExportingReceiptPdf, setIsExportingReceiptPdf] = useState(false);
+  const [isReceiptPdfExportOptionsOpen, setIsReceiptPdfExportOptionsOpen] = useState(false);
   const [businessSettings, setBusinessSettings] = useState<Business | null>(null);
   const [inventoryUnitById, setInventoryUnitById] = useState<Record<string, string>>({});
   const [receiptPaperWidth, setReceiptPaperWidth] = useState<PrinterPaperWidth>('80mm');
@@ -746,47 +753,85 @@ export default function SaleDetailModal({ order, isOpen, onOpenChange }: { order
     }
   };
 
-  const handleExportReceiptPdf = async () => {
+  const prepareReceiptPdf = useCallback(async () => {
     if (!order) {
-      return;
+      throw new Error('No sale selected to export.');
     }
 
+    setReceiptCopyNumber(1);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const orderNumber = String(
+      (order as any).fiscalInvoiceNumber ??
+      (order as any).fiscal_invoice_number ??
+      (order as any).orderNumber ??
+      (order as any).order_number ??
+      'receipt'
+    ).trim();
+    return generateThermalReceiptPdf({
+      elementId: 'receipt-printable-area',
+      paperWidth: receiptPaperWidth,
+      filename: `handypos-receipt-${orderNumber}`,
+    });
+  }, [order, receiptPaperWidth]);
+
+  const handleDownloadReceiptPdf = useCallback(async () => {
+    setIsReceiptPdfExportOptionsOpen(false);
     try {
       setIsExportingReceiptPdf(true);
-      setReceiptCopyNumber(1);
-      await new Promise((resolve) => setTimeout(resolve, 120));
-      const orderNumber = String(
-        (order as any).fiscalInvoiceNumber ??
-        (order as any).fiscal_invoice_number ??
-        (order as any).orderNumber ??
-        (order as any).order_number ??
-        'receipt'
-      ).trim();
-      const result = await exportThermalReceiptPdf({
-        elementId: 'receipt-printable-area',
-        paperWidth: receiptPaperWidth,
-        filename: `handypos-receipt-${orderNumber}`,
-      });
+      const document = await prepareReceiptPdf();
+      const result = await downloadThermalReceiptPdf(document);
       toast({
-        title: 'Receipt PDF Exported',
+        title: 'Receipt PDF Downloaded',
         description: result.location === 'tauri'
           ? `Saved to ${result.path}`
           : `${result.filename} downloaded.`,
       });
     } catch (error) {
-      console.error('[Receipt PDF] Export failed:', error);
+      console.error('[Receipt PDF] Download failed:', error);
       toast({
         variant: 'destructive',
-        title: 'PDF Export Failed',
-        description: 'Could not export the thermal receipt PDF.',
+        title: 'PDF Download Failed',
+        description: error instanceof Error ? error.message : 'Could not download the thermal receipt PDF.',
       });
     } finally {
       setIsExportingReceiptPdf(false);
     }
-  };
+  }, [prepareReceiptPdf, toast]);
+
+  const handleShareReceiptPdf = useCallback(async () => {
+    setIsReceiptPdfExportOptionsOpen(false);
+    try {
+      setIsExportingReceiptPdf(true);
+      const document = await prepareReceiptPdf();
+      await shareThermalReceiptPdf(document);
+      toast({ title: 'Receipt PDF Shared', description: 'Choose an app from the share sheet.' });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
+      console.error('[Receipt PDF] Share failed:', error);
+      toast({
+        variant: 'destructive',
+        title: 'PDF Share Failed',
+        description: error instanceof Error ? error.message : 'Could not share the thermal receipt PDF.',
+      });
+    } finally {
+      setIsExportingReceiptPdf(false);
+    }
+  }, [prepareReceiptPdf, toast]);
+
+  const handleExportReceiptPdf = useCallback(() => {
+    setIsReceiptPdfExportOptionsOpen(true);
+  }, []);
 
   return (
     <>
+      <ReceiptPdfExportDialog
+        open={isReceiptPdfExportOptionsOpen}
+        onOpenChange={setIsReceiptPdfExportOptionsOpen}
+        canShare={canShareThermalReceiptPdf()}
+        isBusy={isExportingReceiptPdf}
+        onDownload={handleDownloadReceiptPdf}
+        onShare={handleShareReceiptPdf}
+      />
       <Dialog open={isOpen} onOpenChange={onOpenChange}>
         <DialogContent className="flex max-h-[95vh] max-h-[95dvh] w-[calc(100vw-0.75rem)] max-w-4xl flex-col overflow-hidden p-4 sm:w-[95vw] sm:p-6">
           <DialogHeader className="gap-3 pr-8 text-left sm:flex-row sm:items-start sm:justify-between">

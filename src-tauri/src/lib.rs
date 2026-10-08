@@ -5,6 +5,8 @@ use std::thread;
 #[cfg(not(target_os = "android"))]
 use std::time::Duration;
 use tauri::Manager;
+#[cfg(target_os = "android")]
+use tauri::WebviewWindow;
 #[cfg(not(target_os = "android"))]
 use tauri::{AppHandle, Listener, PhysicalSize, Size, WebviewWindow};
 
@@ -198,72 +200,104 @@ fn clear_session_snapshot(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn save_receipt_pdf(
     app: tauri::AppHandle,
+    window: WebviewWindow,
     filename: String,
     content: Vec<u8>,
 ) -> Result<String, String> {
-    if content.is_empty() {
-        return Err("Receipt PDF is empty.".to_string());
+    #[cfg(target_os = "android")]
+    {
+        let _ = app;
+        return printer::save_receipt_pdf_android(window, filename, content);
     }
 
-    let sanitized_filename = filename
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = window;
 
-    let mut final_filename = if sanitized_filename.trim().is_empty() {
-        "thermal-receipt.pdf".to_string()
-    } else {
-        sanitized_filename
-    };
-    if !final_filename.to_ascii_lowercase().ends_with(".pdf") {
-        final_filename.push_str(".pdf");
-    }
-
-    let mut target_directories: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(dir) = app.path().download_dir() {
-        target_directories.push(dir);
-    }
-    if let Ok(dir) = app.path().document_dir() {
-        target_directories.push(dir);
-    }
-    if let Ok(dir) = app.path().data_dir() {
-        target_directories.push(dir);
-    }
-    if let Ok(dir) = app.path().cache_dir() {
-        target_directories.push(dir);
-    }
-
-    let mut last_error: Option<String> = None;
-    for directory in target_directories {
-        if let Err(error) = std::fs::create_dir_all(&directory) {
-            last_error = Some(format!(
-                "Could not create directory {}: {}",
-                directory.display(),
-                error
-            ));
-            continue;
+        if content.is_empty() {
+            return Err("Receipt PDF is empty.".to_string());
         }
 
-        let output_path = directory.join(&final_filename);
-        match std::fs::write(&output_path, &content) {
-            Ok(_) => return Ok(output_path.display().to_string()),
-            Err(error) => {
+        let sanitized_filename = filename
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+
+        let mut final_filename = if sanitized_filename.trim().is_empty() {
+            "thermal-receipt.pdf".to_string()
+        } else {
+            sanitized_filename
+        };
+        if !final_filename.to_ascii_lowercase().ends_with(".pdf") {
+            final_filename.push_str(".pdf");
+        }
+
+        let mut target_directories: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(dir) = app.path().download_dir() {
+            target_directories.push(dir);
+        }
+        if let Ok(dir) = app.path().document_dir() {
+            target_directories.push(dir);
+        }
+        if let Ok(dir) = app.path().data_dir() {
+            target_directories.push(dir);
+        }
+        if let Ok(dir) = app.path().cache_dir() {
+            target_directories.push(dir);
+        }
+
+        let mut last_error: Option<String> = None;
+        for directory in target_directories {
+            if let Err(error) = std::fs::create_dir_all(&directory) {
                 last_error = Some(format!(
-                    "Failed writing {}: {}",
-                    output_path.display(),
+                    "Could not create directory {}: {}",
+                    directory.display(),
                     error
                 ));
+                continue;
+            }
+
+            let output_path = directory.join(&final_filename);
+            match std::fs::write(&output_path, &content) {
+                Ok(_) => return Ok(output_path.display().to_string()),
+                Err(error) => {
+                    last_error = Some(format!(
+                        "Failed writing {}: {}",
+                        output_path.display(),
+                        error
+                    ));
+                }
             }
         }
+
+        Err(last_error.unwrap_or_else(|| {
+            "No writable directory available for receipt PDF export.".to_string()
+        }))
+    }
+}
+
+#[tauri::command]
+fn share_receipt_pdf(
+    window: WebviewWindow,
+    filename: String,
+    content: Vec<u8>,
+) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        return printer::share_receipt_pdf_android(window, filename, content);
     }
 
-    Err(last_error.unwrap_or_else(|| "No writable directory available for receipt PDF export.".to_string()))
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (window, filename, content);
+        Err("Native receipt sharing is only available on Android.".to_string())
+    }
 }
 
 #[tauri::command]
@@ -391,6 +425,7 @@ pub fn run() {
         get_device_identity,
         get_device_mac_address,
         save_receipt_pdf,
+        share_receipt_pdf,
         save_inventory_template_csv,
     ]);
 

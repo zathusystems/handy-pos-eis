@@ -61,7 +61,13 @@ import {
 import { getNextReceiptCopyNumber, markReceiptPrinted } from '@/lib/services/receipt-copy-service';
 import { safeLocalStorageGetItem } from '@/lib/safe-local-storage';
 import { formatInventoryQuantity } from '@/lib/quantity-format';
-import { exportThermalReceiptPdf } from '@/lib/thermal-receipt-pdf';
+import {
+  canShareThermalReceiptPdf,
+  downloadThermalReceiptPdf,
+  generateThermalReceiptPdf,
+  shareThermalReceiptPdf,
+} from '@/lib/thermal-receipt-pdf';
+import { ReceiptPdfExportDialog } from './receipt-pdf-export-dialog';
 
 export type BuyerDetails = {
   name?: string;
@@ -2091,6 +2097,7 @@ const PaymentDialog = ({
     const [autoPrintHandled, setAutoPrintHandled] = useState(false);
     const [isAutoPrintRunning, setIsAutoPrintRunning] = useState(false);
     const [isReceiptPreviewOpen, setIsReceiptPreviewOpen] = useState(false);
+    const [isReceiptPdfExportOptionsOpen, setIsReceiptPdfExportOptionsOpen] = useState(false);
     const [isPreparingReceiptPreview, setIsPreparingReceiptPreview] = useState(false);
     const [isExportingReceiptPdf, setIsExportingReceiptPdf] = useState(false);
     const [hasDefaultPrinter, setHasDefaultPrinter] = useState<boolean | null>(null);
@@ -2487,69 +2494,96 @@ const PaymentDialog = ({
         }
     }, [activeBranchId, applyPrinterSettingsToReceipt, completedOrder, eisEnabled, toast, waitForFiscalReceiptData]);
 
-    const handleExportReceiptPdf = useCallback(async () => {
+    const prepareReceiptPdf = useCallback(async () => {
         const activeOrder = completedOrder as Order | null;
         if (!activeOrder) {
-            toast({
-                variant: 'destructive',
-                title: 'PDF Export Failed',
-                description: 'No completed order found to export.',
-            });
-            return;
+            throw new Error('No completed order found to export.');
         }
 
+        let receiptOrder = activeOrder;
+        if (eisEnabled && !hasFiscalReceiptPrintData(receiptOrder)) {
+            receiptOrder = await waitForFiscalReceiptData(receiptOrder, 45000);
+            if (!hasFiscalReceiptPrintData(receiptOrder)) {
+                toast({
+                    variant: isOfflineQueuedReceipt(receiptOrder) ? 'default' : 'destructive',
+                    title: isOfflineQueuedReceipt(receiptOrder) ? 'Offline Receipt Queued' : 'Receipt Not Ready',
+                    description: isOfflineQueuedReceipt(receiptOrder)
+                        ? 'The receipt is queued for backend replay.'
+                        : 'The fiscal receipt is not ready yet.',
+                });
+                return null;
+            }
+            setCompletedOrder(receiptOrder);
+        }
+
+        setReceiptCopyNumber(1);
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        const elementId = document.getElementById('mra-receipt-preview-area')
+            ? 'mra-receipt-preview-area'
+            : 'receipt-printable-area';
+        const orderNumber = String(
+            (receiptOrder as any).fiscalInvoiceNumber ??
+            (receiptOrder as any).fiscal_invoice_number ??
+            (receiptOrder as any).orderNumber ??
+            (receiptOrder as any).order_number ??
+            'receipt'
+        ).trim();
+        return generateThermalReceiptPdf({
+            elementId,
+            paperWidth: receiptPaperWidth,
+            filename: `handypos-receipt-${orderNumber}`,
+        });
+    }, [completedOrder, eisEnabled, receiptPaperWidth, toast, waitForFiscalReceiptData]);
+
+    const handleDownloadReceiptPdf = useCallback(async () => {
+        setIsReceiptPdfExportOptionsOpen(false);
         try {
             setIsExportingReceiptPdf(true);
-            let receiptOrder = activeOrder;
-            if (eisEnabled && !hasFiscalReceiptPrintData(receiptOrder)) {
-                receiptOrder = await waitForFiscalReceiptData(receiptOrder, 45000);
-                if (!hasFiscalReceiptPrintData(receiptOrder)) {
-                    toast({
-                        variant: isOfflineQueuedReceipt(receiptOrder) ? 'default' : 'destructive',
-                        title: isOfflineQueuedReceipt(receiptOrder) ? 'Offline Receipt Queued' : 'Receipt Not Ready',
-                        description: isOfflineQueuedReceipt(receiptOrder)
-                            ? 'The receipt is queued for backend replay.'
-                            : 'The fiscal receipt is not ready yet.',
-                    });
-                    return;
-                }
-                setCompletedOrder(receiptOrder);
-            }
-
-            setReceiptCopyNumber(1);
-            await new Promise((resolve) => setTimeout(resolve, 120));
-            const elementId = document.getElementById('mra-receipt-preview-area')
-                ? 'mra-receipt-preview-area'
-                : 'receipt-printable-area';
-            const orderNumber = String(
-                (receiptOrder as any).fiscalInvoiceNumber ??
-                (receiptOrder as any).fiscal_invoice_number ??
-                (receiptOrder as any).orderNumber ??
-                (receiptOrder as any).order_number ??
-                'receipt'
-            ).trim();
-            const result = await exportThermalReceiptPdf({
-                elementId,
-                paperWidth: receiptPaperWidth,
-                filename: `handypos-receipt-${orderNumber}`,
-            });
+            const document = await prepareReceiptPdf();
+            if (!document) return;
+            const result = await downloadThermalReceiptPdf(document);
             toast({
-                title: 'Receipt PDF Exported',
+                title: 'Receipt PDF Downloaded',
                 description: result.location === 'tauri'
                     ? `Saved to ${result.path}`
                     : `${result.filename} downloaded.`,
             });
         } catch (error) {
-            console.error('[Receipt PDF] Export failed:', error);
+            console.error('[Receipt PDF] Download failed:', error);
             toast({
                 variant: 'destructive',
-                title: 'PDF Export Failed',
-                description: 'Could not export the thermal receipt PDF.',
+                title: 'PDF Download Failed',
+                description: error instanceof Error ? error.message : 'Could not download the thermal receipt PDF.',
             });
         } finally {
             setIsExportingReceiptPdf(false);
         }
-    }, [completedOrder, eisEnabled, receiptPaperWidth, toast, waitForFiscalReceiptData]);
+    }, [prepareReceiptPdf, toast]);
+
+    const handleShareReceiptPdf = useCallback(async () => {
+        setIsReceiptPdfExportOptionsOpen(false);
+        try {
+            setIsExportingReceiptPdf(true);
+            const document = await prepareReceiptPdf();
+            if (!document) return;
+            await shareThermalReceiptPdf(document);
+            toast({ title: 'Receipt PDF Shared', description: 'Choose an app from the share sheet.' });
+        } catch (error) {
+            if (error instanceof DOMException && error.name === 'AbortError') return;
+            console.error('[Receipt PDF] Share failed:', error);
+            toast({
+                variant: 'destructive',
+                title: 'PDF Share Failed',
+                description: error instanceof Error ? error.message : 'Could not share the thermal receipt PDF.',
+            });
+        } finally {
+            setIsExportingReceiptPdf(false);
+        }
+    }, [prepareReceiptPdf, toast]);
+
+    const handleExportReceiptPdf = useCallback(() => {
+        setIsReceiptPdfExportOptionsOpen(true);
+    }, []);
 
     useEffect(() => {
         if (step !== 'confirmation' || !completedOrder || autoPrintHandled) {
@@ -2812,6 +2846,14 @@ const PaymentDialog = ({
                         copyNumber={receiptCopyNumber}
                     />
                  </div>
+                <ReceiptPdfExportDialog
+                    open={isReceiptPdfExportOptionsOpen}
+                    onOpenChange={setIsReceiptPdfExportOptionsOpen}
+                    canShare={canShareThermalReceiptPdf()}
+                    isBusy={isExportingReceiptPdf}
+                    onDownload={handleDownloadReceiptPdf}
+                    onShare={handleShareReceiptPdf}
+                />
                 <Dialog open={isReceiptPreviewOpen} onOpenChange={setIsReceiptPreviewOpen}>
                     <DialogContent className="tauri-android-safe-bottom max-h-[calc(100vh-1rem)] max-h-[calc(100dvh-1rem)] w-[calc(100vw-1rem)] max-w-[420px] overflow-y-auto p-4 sm:p-6">
                         <DialogHeader>

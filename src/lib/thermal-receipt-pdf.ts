@@ -8,7 +8,12 @@ type ThermalReceiptPdfOptions = {
   filename: string;
 };
 
-type ThermalReceiptPdfResult = {
+export type ThermalReceiptPdfDocument = {
+  filename: string;
+  bytes: Uint8Array;
+};
+
+export type ThermalReceiptPdfResult = {
   filename: string;
   location: 'download' | 'tauri';
   path?: string;
@@ -39,51 +44,101 @@ const isTauriRuntime = (): boolean => {
   }
 };
 
+const isAndroidRuntime = (): boolean => {
+  try {
+    return /android/i.test(navigator.userAgent);
+  } catch {
+    return false;
+  }
+};
+
+const createPdfBlob = (bytes: Uint8Array): Blob => (
+  new Blob([new Uint8Array(bytes).buffer], { type: 'application/pdf' })
+);
+
 const downloadBytes = (bytes: Uint8Array, filename: string): void => {
-  const blob = new Blob([new Uint8Array(bytes).buffer], { type: 'application/pdf' });
-  const url = URL.createObjectURL(blob);
+  const url = URL.createObjectURL(createPdfBlob(bytes));
   const anchor = document.createElement('a');
   anchor.href = url;
   anchor.download = filename;
   anchor.rel = 'noopener';
+  anchor.style.display = 'none';
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
 
-const saveBytesInTauri = async (
-  bytes: Uint8Array,
-  filename: string
-): Promise<string | null> => {
-  if (!isTauriRuntime()) {
-    return null;
+const invokeTauri = async <T>(command: string, args: Record<string, unknown>): Promise<T> => {
+  const { invoke } = await import('@tauri-apps/api/core');
+  if (typeof invoke !== 'function') {
+    throw new Error('The native export service is unavailable.');
   }
+  return invoke<T>(command, args);
+};
 
+export const canShareThermalReceiptPdf = (): boolean => {
   try {
-    const { invoke } = await import('@tauri-apps/api/core');
-    if (typeof invoke !== 'function') {
-      return null;
-    }
-
-    const savedPath = await invoke<string>('save_receipt_pdf', {
-      filename,
-      content: Array.from(bytes),
-    });
-    return String(savedPath || '').trim() || null;
-  } catch (error) {
-    console.warn('[Receipt PDF] Native Tauri save unavailable, using download fallback:', error);
-    return null;
+    return Boolean(
+      (isTauriRuntime() && isAndroidRuntime()) ||
+      typeof navigator.share === 'function'
+    );
+  } catch {
+    return false;
   }
 };
 
-/**
- * Export the existing rendered thermal receipt. Capturing the rendered DOM
- * keeps PDF output aligned with the receipt sent to thermal printers.
- */
-export async function exportThermalReceiptPdf(
-  options: ThermalReceiptPdfOptions
+export async function downloadThermalReceiptPdf(
+  document: ThermalReceiptPdfDocument
 ): Promise<ThermalReceiptPdfResult> {
+  if (isTauriRuntime()) {
+    const savedPath = await invokeTauri<string>('save_receipt_pdf', {
+      filename: document.filename,
+      content: Array.from(document.bytes),
+    });
+    const path = String(savedPath || '').trim();
+    if (!path) {
+      throw new Error('The PDF was not saved.');
+    }
+    return { filename: document.filename, location: 'tauri', path };
+  }
+
+  downloadBytes(document.bytes, document.filename);
+  return { filename: document.filename, location: 'download' };
+}
+
+export async function shareThermalReceiptPdf(
+  document: ThermalReceiptPdfDocument
+): Promise<void> {
+  if (isTauriRuntime() && isAndroidRuntime()) {
+    await invokeTauri<void>('share_receipt_pdf', {
+      filename: document.filename,
+      content: Array.from(document.bytes),
+    });
+    return;
+  }
+
+  if (typeof navigator.share !== 'function') {
+    throw new Error('Sharing is not supported on this device.');
+  }
+
+  const file = new File([new Uint8Array(document.bytes)], document.filename, {
+    type: 'application/pdf',
+  });
+  if (typeof navigator.canShare === 'function' && !navigator.canShare({ files: [file] })) {
+    throw new Error('This device cannot share PDF files.');
+  }
+
+  await navigator.share({
+    files: [file],
+    title: 'HandyPOS receipt',
+  });
+}
+
+/** Generate a PDF from the rendered thermal receipt without choosing a destination. */
+export async function generateThermalReceiptPdf(
+  options: ThermalReceiptPdfOptions
+): Promise<ThermalReceiptPdfDocument> {
   if (typeof window === 'undefined' || typeof document === 'undefined') {
     throw new Error('Receipt PDF export is only available in the application window.');
   }
@@ -149,15 +204,19 @@ export async function exportThermalReceiptPdf(
       'FAST'
     );
 
-    const bytes = new Uint8Array(pdf.output('arraybuffer') as ArrayBuffer);
-    const nativePath = await saveBytesInTauri(bytes, filename);
-    if (nativePath) {
-      return { filename, location: 'tauri', path: nativePath };
-    }
-
-    downloadBytes(bytes, filename);
-    return { filename, location: 'download' };
+    return {
+      filename,
+      bytes: new Uint8Array(pdf.output('arraybuffer') as ArrayBuffer),
+    };
   } finally {
     clone.remove();
   }
+}
+
+/** Backwards-compatible one-click export used by non-action-menu callers. */
+export async function exportThermalReceiptPdf(
+  options: ThermalReceiptPdfOptions
+): Promise<ThermalReceiptPdfResult> {
+  const document = await generateThermalReceiptPdf(options);
+  return downloadThermalReceiptPdf(document);
 }

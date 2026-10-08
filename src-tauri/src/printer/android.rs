@@ -15,6 +15,7 @@ const BLUETOOTH_PRINTER_KEYWORDS: &[&str] = &[
     "printer", "thermal", "receipt", "epson", "star", "sunmi", "xprinter", "bixolon", "rongta",
     "gprinter", "pos",
 ];
+const ANDROID_PDF_CACHE_DIR: &str = "handypos-receipts";
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct PrinterInfo {
@@ -348,6 +349,329 @@ fn close_java_resource(env: &mut jni::JNIEnv<'_>, object: &JObject<'_>) {
     if env.exception_check().unwrap_or(false) {
         let _ = env.exception_clear();
     }
+}
+
+fn safe_file_name(value: &str, fallback: &str) -> String {
+    let mut name = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+
+    if name.trim().is_empty() {
+        name = fallback.to_string();
+    }
+    if !name.to_ascii_lowercase().ends_with(".pdf") {
+        name.push_str(".pdf");
+    }
+    name
+}
+
+fn put_content_value_string(
+    env: &mut jni::JNIEnv<'_>,
+    values: &JObject<'_>,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let key_j = env
+        .new_string(key)
+        .map_err(|error| format!("Failed to prepare Android file metadata key: {error}"))?;
+    let value_j = env
+        .new_string(value)
+        .map_err(|error| format!("Failed to prepare Android file metadata value: {error}"))?;
+    env.call_method(
+        values,
+        "put",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        &[(&key_j).into(), (&value_j).into()],
+    )
+    .map_err(|error| jni_error_message(env, "Failed to set Android file metadata", error))?;
+    Ok(())
+}
+
+fn put_content_value_integer(
+    env: &mut jni::JNIEnv<'_>,
+    values: &JObject<'_>,
+    key: &str,
+    value: i32,
+) -> Result<(), String> {
+    let key_j = env
+        .new_string(key)
+        .map_err(|error| format!("Failed to prepare Android file metadata key: {error}"))?;
+    let integer = env
+        .call_static_method(
+            "java/lang/Integer",
+            "valueOf",
+            "(I)Ljava/lang/Integer;",
+            &[JValue::Int(value)],
+        )
+        .map_err(|error| jni_error_message(env, "Failed to prepare Android file metadata", error))?
+        .l()
+        .map_err(|error| format!("Invalid Android file metadata value: {error}"))?;
+    env.call_method(
+        values,
+        "put",
+        "(Ljava/lang/String;Ljava/lang/Integer;)V",
+        &[(&key_j).into(), (&integer).into()],
+    )
+    .map_err(|error| jni_error_message(env, "Failed to set Android file metadata", error))?;
+    Ok(())
+}
+
+fn write_android_output_stream(
+    env: &mut jni::JNIEnv<'_>,
+    output_stream: &JObject<'_>,
+    content: &[u8],
+) -> Result<(), String> {
+    let payload = env
+        .byte_array_from_slice(content)
+        .map_err(|error| format!("Failed to prepare receipt PDF bytes: {error}"))?;
+    env.call_method(output_stream, "write", "([B)V", &[(&payload).into()])
+        .map_err(|error| jni_error_message(env, "Failed to write receipt PDF", error))?;
+    env.call_method(output_stream, "flush", "()V", &[])
+        .map_err(|error| jni_error_message(env, "Failed to flush receipt PDF", error))?;
+    Ok(())
+}
+
+/// Saves the PDF into Android's public Downloads collection. App-private
+/// cache/data paths are intentionally not used because users cannot browse
+/// those locations after the Tauri command succeeds.
+pub fn save_receipt_pdf_android(
+    window: WebviewWindow,
+    filename: String,
+    content: Vec<u8>,
+) -> Result<String, String> {
+    if content.is_empty() {
+        return Err("Receipt PDF is empty.".to_string());
+    }
+
+    let final_filename = safe_file_name(&filename, "thermal-receipt.pdf");
+    run_with_android_context(window, move |env, activity, _| {
+        let sdk_int = get_android_sdk_int(env)?;
+        if sdk_int < 29 {
+            return Err("Android PDF download requires Android 10 or newer.".to_string());
+        }
+
+        let resolver = env
+            .call_method(
+                activity,
+                "getContentResolver",
+                "()Landroid/content/ContentResolver;",
+                &[],
+            )
+            .map_err(|error| jni_error_message(env, "Failed to access Android Downloads", error))?
+            .l()
+            .map_err(|error| format!("Invalid Android content resolver: {error}"))?;
+        let downloads_uri = env
+            .get_static_field(
+                "android/provider/MediaStore$Downloads",
+                "EXTERNAL_CONTENT_URI",
+                "Landroid/net/Uri;",
+            )
+            .map_err(|error| jni_error_message(env, "Failed to access Android Downloads", error))?
+            .l()
+            .map_err(|error| format!("Invalid Android Downloads URI: {error}"))?;
+        let values = env
+            .new_object("android/content/ContentValues", "()V", &[])
+            .map_err(|error| format!("Failed to prepare Android Downloads metadata: {error}"))?;
+
+        put_content_value_string(env, &values, "_display_name", &final_filename)?;
+        put_content_value_string(env, &values, "mime_type", "application/pdf")?;
+        put_content_value_string(env, &values, "relative_path", "Download/HandyPOS")?;
+        put_content_value_integer(env, &values, "is_pending", 1)?;
+
+        let item_uri = env
+            .call_method(
+                &resolver,
+                "insert",
+                "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;",
+                &[(&downloads_uri).into(), (&values).into()],
+            )
+            .map_err(|error| {
+                jni_error_message(env, "Failed to create Android PDF download", error)
+            })?
+            .l()
+            .map_err(|error| format!("Invalid Android PDF download URI: {error}"))?;
+        if item_uri.is_null() {
+            return Err("Android did not create a Downloads file.".to_string());
+        }
+
+        let output_stream = env
+            .call_method(
+                &resolver,
+                "openOutputStream",
+                "(Landroid/net/Uri;)Ljava/io/OutputStream;",
+                &[(&item_uri).into()],
+            )
+            .map_err(|error| jni_error_message(env, "Failed to open Android PDF download", error))?
+            .l()
+            .map_err(|error| format!("Invalid Android PDF output stream: {error}"))?;
+        if output_stream.is_null() {
+            return Err("Android could not open the Downloads file.".to_string());
+        }
+
+        let write_result = write_android_output_stream(env, &output_stream, &content);
+        close_java_resource(env, &output_stream);
+        write_result?;
+
+        env.call_method(&values, "clear", "()V", &[])
+            .map_err(|error| {
+                jni_error_message(env, "Failed to finalize Android PDF download", error)
+            })?;
+        put_content_value_integer(env, &values, "is_pending", 0)?;
+        let null_selection = JObject::null();
+        let null_selection_args = JObject::null();
+        env.call_method(
+            &resolver,
+            "update",
+            "(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I",
+            &[
+                (&item_uri).into(),
+                (&values).into(),
+                (&null_selection).into(),
+                (&null_selection_args).into(),
+            ],
+        )
+        .map_err(|error| jni_error_message(env, "Failed to finalize Android PDF download", error))?;
+
+        Ok(format!("Downloads/HandyPOS/{final_filename}"))
+    })
+}
+
+/// Shares a receipt through Android's system share sheet using a FileProvider
+/// URI, so receiving apps can read the PDF without broad storage permissions.
+pub fn share_receipt_pdf_android(
+    window: WebviewWindow,
+    filename: String,
+    content: Vec<u8>,
+) -> Result<(), String> {
+    if content.is_empty() {
+        return Err("Receipt PDF is empty.".to_string());
+    }
+
+    let final_filename = safe_file_name(&filename, "thermal-receipt.pdf");
+    run_with_android_context(window, move |env, activity, _| {
+        let cache_dir = env
+            .call_method(activity, "getCacheDir", "()Ljava/io/File;", &[])
+            .map_err(|error| {
+                jni_error_message(env, "Failed to access Android receipt cache", error)
+            })?
+            .l()
+            .map_err(|error| format!("Invalid Android cache directory: {error}"))?;
+        let cache_path = env
+            .call_method(&cache_dir, "getAbsolutePath", "()Ljava/lang/String;", &[])
+            .map_err(|error| {
+                jni_error_message(env, "Failed to resolve Android receipt cache", error)
+            })?
+            .l()
+            .map_err(|error| format!("Invalid Android cache path: {error}"))?;
+        let cache_path =
+            read_java_string(env, cache_path, "Failed to read Android receipt cache path")?;
+        let receipt_dir = std::path::PathBuf::from(cache_path).join(ANDROID_PDF_CACHE_DIR);
+        std::fs::create_dir_all(&receipt_dir)
+            .map_err(|error| format!("Failed to prepare Android receipt cache: {error}"))?;
+        let receipt_path = receipt_dir.join(&final_filename);
+        std::fs::write(&receipt_path, &content)
+            .map_err(|error| format!("Failed to prepare receipt for sharing: {error}"))?;
+
+        let path_j = env
+            .new_string(receipt_path.to_string_lossy().as_ref())
+            .map_err(|error| format!("Failed to prepare receipt share path: {error}"))?;
+        let file = env
+            .new_object("java/io/File", "(Ljava/lang/String;)V", &[(&path_j).into()])
+            .map_err(|error| format!("Failed to prepare receipt share file: {error}"))?;
+        let package_name = env
+            .call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])
+            .map_err(|error| {
+                jni_error_message(env, "Failed to resolve Android app identity", error)
+            })?
+            .l()
+            .map_err(|error| format!("Invalid Android app identity: {error}"))?;
+        let package_name =
+            read_java_string(env, package_name, "Failed to read Android app identity")?;
+        let authority_j = env
+            .new_string(format!("{package_name}.fileprovider"))
+            .map_err(|error| format!("Failed to prepare Android share authority: {error}"))?;
+        let item_uri = env
+            .call_static_method(
+                "androidx/core/content/FileProvider",
+                "getUriForFile",
+                "(Landroid/content/Context;Ljava/lang/String;Ljava/io/File;)Landroid/net/Uri;",
+                &[(&activity).into(), (&authority_j).into(), (&file).into()],
+            )
+            .map_err(|error| {
+                jni_error_message(env, "Failed to create Android share attachment", error)
+            })?
+            .l()
+            .map_err(|error| format!("Invalid Android share attachment: {error}"))?;
+
+        let action_j = env
+            .new_string("android.intent.action.SEND")
+            .map_err(|error| format!("Failed to prepare Android share action: {error}"))?;
+        let intent = env
+            .new_object(
+                "android/content/Intent",
+                "(Ljava/lang/String;)V",
+                &[(&action_j).into()],
+            )
+            .map_err(|error| format!("Failed to prepare Android share intent: {error}"))?;
+        let mime_j = env
+            .new_string("application/pdf")
+            .map_err(|error| format!("Failed to prepare PDF share type: {error}"))?;
+        env.call_method(
+            &intent,
+            "setType",
+            "(Ljava/lang/String;)Landroid/content/Intent;",
+            &[(&mime_j).into()],
+        )
+        .map_err(|error| jni_error_message(env, "Failed to set Android share type", error))?;
+        let stream_key = env
+            .new_string("android.intent.extra.STREAM")
+            .map_err(|error| format!("Failed to prepare Android share attachment key: {error}"))?;
+        env.call_method(
+            &intent,
+            "putExtra",
+            "(Ljava/lang/String;Landroid/os/Parcelable;)Landroid/content/Intent;",
+            &[(&stream_key).into(), (&item_uri).into()],
+        )
+        .map_err(|error| jni_error_message(env, "Failed to attach receipt PDF", error))?;
+        env.call_method(
+            &intent,
+            "addFlags",
+            "(I)Landroid/content/Intent;",
+            &[JValue::Int(1)],
+        )
+        .map_err(|error| jni_error_message(env, "Failed to authorize receipt sharing", error))?;
+
+        let chooser_title = env
+            .new_string("Share receipt PDF")
+            .map_err(|error| format!("Failed to prepare Android share title: {error}"))?;
+        let chooser = env
+            .call_static_method(
+                "android/content/Intent",
+                "createChooser",
+                "(Landroid/content/Intent;Ljava/lang/CharSequence;)Landroid/content/Intent;",
+                &[(&intent).into(), (&chooser_title).into()],
+            )
+            .map_err(|error| {
+                jni_error_message(env, "Failed to prepare Android share sheet", error)
+            })?
+            .l()
+            .map_err(|error| format!("Invalid Android share sheet: {error}"))?;
+        env.call_method(
+            activity,
+            "startActivity",
+            "(Landroid/content/Intent;)V",
+            &[(&chooser).into()],
+        )
+        .map_err(|error| jni_error_message(env, "Failed to open Android share sheet", error))?;
+        Ok(())
+    })
 }
 
 fn create_bluetooth_socket<'local>(
